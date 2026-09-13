@@ -219,6 +219,24 @@ impl Pet {
         pool.last().copied()
     }
 
+    /// The animation to fall into when support vanishes and the current
+    /// animation has nothing to say about it.
+    ///
+    /// Derived from the data rather than hardcoded: it is whichever animation
+    /// the pet's `<gravity>` blocks point at most often.
+    pub fn fall_animation(&self) -> Option<u32> {
+        let mut counts: HashMap<u32, usize> = HashMap::new();
+        for a in self.animations.values() {
+            for n in &a.gravity {
+                *counts.entry(n.target).or_default() += 1;
+            }
+        }
+        let mut best: Vec<(u32, usize)> = counts.into_iter().collect();
+        // Sort by popularity, then by id, so the choice is stable.
+        best.sort_by_key(|(id, n)| (std::cmp::Reverse(*n), *id));
+        best.first().map(|(id, _)| *id).or_else(|| self.by_name("fall").map(|a| a.id))
+    }
+
     /// Weighted pick of a spawn point.
     pub fn choose_spawn(&self) -> Option<&Spawn> {
         // The reference sums `spawns[0]` in a loop, making later spawns

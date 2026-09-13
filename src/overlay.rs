@@ -51,9 +51,6 @@ const MAX_STEPS_PER_FRAME: usize = 8;
 struct Pen {
     sheep: Sheep,
     next_step: Instant,
-    /// Last (animation, step) reported by the trace, so that re-entering the
-    /// same animation still logs.
-    traced: (u32, u32),
 }
 
 /// One output's overlay surface.
@@ -241,7 +238,7 @@ impl Overlay {
             }
             None => sheep.spawn(&self.pet, &self.world, self.tile, &mut events),
         }
-        self.flock.push(Pen { sheep, next_step: Instant::now(), traced: (u32::MAX, 0) });
+        self.flock.push(Pen { sheep, next_step: Instant::now() });
         self.handle(events);
     }
 
@@ -290,35 +287,38 @@ impl Overlay {
         for (i, pen) in self.flock.iter_mut().enumerate() {
             let mut steps = 0;
             while now >= pen.next_step && steps < MAX_STEPS_PER_FRAME {
+                let before = pen.sheep.animation;
                 let delay = pen.sheep.step(&self.pet, &self.world, self.tile, &mut events);
                 pen.next_step += delay;
                 steps += 1;
+                // Log inside the loop: several steps can run between frames,
+                // and sampling afterwards hides the transitions in between.
+                if self.trace && pen.sheep.animation != before {
+                    let name = self
+                        .pet
+                        .get(pen.sheep.animation)
+                        .map(|a| a.name.as_str())
+                        .unwrap_or("?");
+                    println!(
+                        "{:>3} {:<18} mon {} at ({:>6.0},{:>5.0}) {}{}",
+                        pen.sheep.animation,
+                        name,
+                        pen.sheep.screen(&self.world, self.tile).id,
+                        pen.sheep.x,
+                        pen.sheep.y,
+                        if pen.sheep.flipped { "flipped " } else { "" },
+                        match pen.sheep.resting_on() {
+                            Some(id) => format!("on window {id:#x}"),
+                            None => "airborne".to_string(),
+                        }
+                    );
+                }
             }
             // If we fell far behind, resynchronise rather than sprinting.
             if steps == MAX_STEPS_PER_FRAME && now > pen.next_step {
                 pen.next_step = now;
             }
 
-            let restarted = pen.sheep.animation != pen.traced.0 || pen.sheep.step < pen.traced.1;
-            if self.trace && restarted {
-                pen.traced = (pen.sheep.animation, pen.sheep.step);
-                let name =
-                    self.pet.get(pen.sheep.animation).map(|a| a.name.as_str()).unwrap_or("?");
-                println!(
-                    "{:>3} {:<18} at ({:>6.0},{:>5.0}) {}{}",
-                    pen.sheep.animation,
-                    name,
-                    pen.sheep.x,
-                    pen.sheep.y,
-                    if pen.sheep.flipped { "flipped " } else { "" },
-                    match pen.sheep.resting_on() {
-                        Some(id) => format!("on window {id:#x}"),
-                        None => "airborne".to_string(),
-                    }
-                );
-            } else if self.trace {
-                pen.traced.1 = pen.sheep.step;
-            }
 
             if events.contains(&Event::Died) {
                 dead.push(i);

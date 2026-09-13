@@ -131,6 +131,9 @@ pub struct Sheep {
     steps: u32,
 }
 
+/// How far past a window's edge the sheep will still step back on. Beyond
+/// this it is not a ledge any more: the window moved out from under it.
+const NUDGE_REACH: f64 = 40.0;
 /// While being dragged the original ignores physics and ticks at a fixed rate.
 const DRAG_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -345,12 +348,26 @@ impl Sheep {
         y2: f64,
         events: &mut Vec<Event>,
     ) -> Option<u32> {
+        // Revalidate support up front so that every decision below - the
+        // `only` filters included - sees whether the sheep is really still on
+        // a window, rather than a claim left over from an earlier step.
+        let had_support = self.resting_on.is_some();
+        let supported_now = self
+            .resting_on
+            .and_then(|id| world.find(id).copied())
+            .is_some_and(|r| self.stands_on(&r, tile, true));
+
         // 1. Sequence complete.
         if self.step >= self.steps {
             if anim.action == Action::Flip {
                 self.flipped = !self.flipped;
             }
-            self.update_situation(world, tile);
+            // Let go of a window we are no longer on, so that what comes next
+            // is chosen against the truth rather than a stale claim.
+            if !supported_now {
+                self.resting_on = None;
+            }
+            self.update_situation(world, tile, supported_now);
             return match pet.choose(&anim.next, self.situation) {
                 Some(n) => Some(n.target),
                 None => {
@@ -370,6 +387,9 @@ impl Sheep {
         //    edge with another monitor behind it is not an edge at all - the
         //    sheep walks straight across the seam.
         let mut hit_border = false;
+        // Set when the sheep is being stepped back onto a ledge it has just
+        // walked off, which counts as still having support this step.
+        let mut nudged = false;
         let screen = self.screen(world, tile);
         let floor = screen.floor() - tile;
         let mid_y = self.y + tile / 2.0;
@@ -418,15 +438,23 @@ impl Sheep {
                 Some(r) => {
                     if !self.stands_on(&r, tile, true) {
                         let feet = self.y + tile;
+                        // Which edge are we off, and by how far?
+                        let (overrun, step_back) = if self.x <= r.left() {
+                            (r.left() - self.x, 3.0)
+                        } else {
+                            (self.x - (r.right() - tile), -3.0)
+                        };
                         if (feet - r.top()).abs() > 3.0 {
                             // The window moved vertically out from under us.
                             self.resting_on = None;
-                        } else if self.x < r.left() {
-                            self.x += 3.0;
-                            hit_border = true;
+                        } else if overrun > NUDGE_REACH {
+                            // Too far past the edge to be a step off it: the
+                            // window was dragged out from under us.
+                            self.resting_on = None;
                         } else {
-                            self.x -= 3.0;
+                            self.x += step_back;
                             hit_border = true;
+                            nudged = true;
                         }
                     }
                 }
@@ -434,38 +462,48 @@ impl Sheep {
         }
 
         if hit_border {
-            self.update_situation(world, tile);
+            self.update_situation(world, tile, supported_now || nudged);
             if let Some(n) = pet.choose(&anim.border, self.situation) {
                 return Some(n.target);
             }
         }
 
         // 3. Gravity: airborne with nothing underfoot.
-        if !anim.gravity.is_empty() && self.y < floor - 2.0 {
-            let supported = match self.resting_on {
-                None => false,
-                Some(id) => match world.find(id).copied() {
-                    Some(r) => self.stands_on(&r, tile, true),
-                    None => false,
-                },
-            };
-            if !supported {
-                self.resting_on = None;
-                self.update_situation(world, tile);
-                if let Some(n) = pet.choose(&anim.gravity, self.situation) {
-                    return Some(n.target);
-                }
+        let supported = nudged || supported_now;
+        if !supported {
+            self.resting_on = None;
+        }
+
+        if !supported && self.y < floor - 2.0 {
+            self.update_situation(world, tile, false);
+            if let Some(n) = pet.choose(&anim.gravity, self.situation) {
+                return Some(n.target);
+            }
+            // Only four of the original's animations declare any <gravity>, so
+            // a sleeping or idling sheep never checks the ground. That is fine
+            // in a browser, where nothing moves underneath it; under a tiling
+            // compositor windows move constantly, and the sheep would hang in
+            // mid-air until its animation happened to end.
+            //
+            // This applies only to a sheep that just lost real support while
+            // in an animation that is not already taking it downwards. An
+            // animation that descends under its own steam - falling, dropping
+            // off a ledge, climbing down a wall - is already dealing with
+            // gravity, and interrupting it would bounce the sheep between
+            // falling and landing forever.
+            if had_support && y2 <= 0.0 {
+                return pet.fall_animation();
             }
         }
 
         None
     }
 
-    fn update_situation(&mut self, world: &World, tile: f64) {
+    fn update_situation(&mut self, world: &World, tile: f64, on_window: bool) {
         let screen = self.screen(world, tile);
         let floor = screen.floor() - tile;
         self.situation = Situation {
-            on_window: self.resting_on.is_some(),
+            on_window,
             on_taskbar: self.y >= floor - 2.0,
             on_vertical: self.x <= screen.x || self.x >= screen.right() - tile,
             on_horizontal: self.y <= screen.y || self.y >= floor - 2.0,
@@ -571,6 +609,147 @@ mod tests {
         }
         panic!("sheep fell past a window at y=42 (ended at y={})", s.y);
     }
+
+    /// Only four of the pet's animations declare any `<gravity>`, so a
+    /// sleeping or idling sheep must still notice when its window moves away
+    /// rather than hanging in mid-air until the animation happens to end.
+    #[test]
+    fn a_sheep_that_is_not_walking_still_falls() {
+        let p = pet();
+        for (id, name) in [(15u32, "sleep1a"), (19, "sleep3a"), (39, "top_walk2"), (16, "sleep1b")]
+        {
+            assert!(p.get(id).unwrap().gravity.is_empty(), "{name} unexpectedly declares gravity");
+
+            let mut w = world();
+            w.windows.push(Rect { id: 7, x: 200.0, y: 600.0, w: 800.0, h: 400.0 });
+            let mut s = Sheep::new(false);
+            let mut ev = Vec::new();
+            s.x = 400.0;
+            s.y = 560.0;
+            s.resting_on = Some(7);
+            s.begin(&p, &w, TILE, id, &mut ev);
+
+            // The window is dragged off to the right, out from under the sheep.
+            w.windows[0].x = 1400.0;
+
+            let mut fell = false;
+            for _ in 0..40 {
+                s.step(&p, &w, TILE, &mut ev);
+                if s.y > 600.0 {
+                    fell = true;
+                    break;
+                }
+            }
+            assert!(fell, "{name} hung in mid-air at y={} after its window moved", s.y);
+            assert_eq!(s.resting_on, None, "{name} still claims to be on the window");
+        }
+    }
+
+    /// An animation that takes the sheep downwards under its own steam is
+    /// already dealing with gravity, so losing support must not yank it into a
+    /// fall midway through.
+    #[test]
+    fn a_descending_animation_is_not_interrupted() {
+        let p = pet();
+        let fall = p.fall_animation().unwrap();
+        // vertical_walk_down climbs down a wall: it descends, declares no
+        // <gravity> of its own, and runs for a long time.
+        let climbing = 41;
+        let a = p.get(climbing).unwrap();
+        assert!(a.gravity.is_empty() && a.end.y == "2", "vertical_walk_down changed shape");
+
+        let w = world();
+        let mut s = Sheep::new(false);
+        let mut ev = Vec::new();
+        s.x = 400.0;
+        s.y = 300.0;
+        // It believes it is on a window that is no longer there.
+        s.resting_on = Some(99);
+        s.begin(&p, &w, TILE, climbing, &mut ev);
+
+        for _ in 0..20 {
+            s.step(&p, &w, TILE, &mut ev);
+            assert_ne!(s.animation, fall, "climbing down was interrupted by a fall");
+        }
+        assert_eq!(s.animation, climbing);
+    }
+
+    /// The sheep must never carry on walking in mid-air. Whenever it is
+    /// unsupported and off the floor in an animation that declares gravity,
+    /// it should fall essentially at once.
+    #[test]
+    fn it_never_walks_in_mid_air() {
+        let p = pet();
+        let mut w = two_screens();
+        w.windows.push(Rect { id: 1, x: 12.0, y: 562.0, w: 851.0, h: 506.0 });
+        w.windows.push(Rect { id: 2, x: 877.0, y: 42.0, w: 506.0, h: 1026.0 });
+
+        let mut s = Sheep::new(false);
+        let mut ev = Vec::new();
+        s.spawn(&p, &w, TILE, &mut ev);
+
+        let mut airborne_run = 0;
+        let mut worst = 0;
+        for _ in 0..200_000 {
+            s.step(&p, &w, TILE, &mut ev);
+            let floor = s.screen(&w, TILE).floor() - TILE;
+            let grounded = s.resting_on.is_some() || s.y >= floor - 2.0;
+            // Animations that declare gravity are the walking-about ones; the
+            // rest are deliberately airborne (falling, jumping, climbing).
+            let should_fall = !grounded && !p.get(s.animation).unwrap().gravity.is_empty();
+            airborne_run = if should_fall { airborne_run + 1 } else { 0 };
+            worst = worst.max(airborne_run);
+            assert!(
+                airborne_run < 3,
+                "walked {airborne_run} steps in mid-air: anim {} ({}) at ({:.0},{:.0}), resting {:?}",
+                s.animation,
+                p.get(s.animation).unwrap().name,
+                s.x,
+                s.y,
+                s.resting_on
+            );
+        }
+        assert!(worst <= 2, "worst airborne run was {worst}");
+    }
+
+    /// Stepping just off a ledge nudges the sheep back on, but a window that
+    /// has moved far away is not a ledge: chasing it would drag the sheep
+    /// across the screen instead of letting it fall.
+    #[test]
+    fn it_steps_back_onto_a_ledge_but_does_not_chase_a_moved_window() {
+        let p = pet();
+
+        // Barely off the left edge: step back on, stay put.
+        let mut w = world();
+        w.windows.push(Rect { id: 7, x: 400.0, y: 600.0, w: 800.0, h: 400.0 });
+        let mut s = Sheep::new(false);
+        let mut ev = Vec::new();
+        s.x = 390.0;
+        s.y = 560.0;
+        s.resting_on = Some(7);
+        s.begin(&p, &w, TILE, 1, &mut ev);
+        for _ in 0..10 {
+            s.step(&p, &w, TILE, &mut ev);
+        }
+        assert_eq!(s.resting_on, Some(7), "nudged off a ledge it had only just left");
+
+        // Far past the edge: the window moved, so let go and fall.
+        let mut w = world();
+        w.windows.push(Rect { id: 7, x: 400.0, y: 600.0, w: 800.0, h: 400.0 });
+        let mut s = Sheep::new(false);
+        s.x = 100.0;
+        s.y = 560.0;
+        s.resting_on = Some(7);
+        s.begin(&p, &w, TILE, 1, &mut ev);
+        let start_x = s.x;
+        for _ in 0..40 {
+            s.step(&p, &w, TILE, &mut ev);
+        }
+        assert_eq!(s.resting_on, None, "still hanging onto a window 300px away");
+        assert!(s.y > 560.0, "never started falling (y={})", s.y);
+        assert!(s.x < start_x + 40.0, "crept toward the distant window (x={})", s.x);
+    }
+
 
     #[test]
     fn a_closed_window_drops_the_sheep() {
