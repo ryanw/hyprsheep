@@ -425,8 +425,13 @@ impl Sheep {
                 // top-row window sits just below the bar, so that test would
                 // make all of them unlandable; require instead that the sheep
                 // ends up on screen.
+                //
+                // On screen means inside *this* monitor, not y >= 0: a monitor
+                // taller than its neighbour is centred against it and starts
+                // at a negative y, which would otherwise make every window in
+                // its top band unlandable.
                 let landing = r.top().ceil() - tile;
-                if landing >= 0.0 {
+                if landing >= screen.y {
                     self.y = landing;
                     self.resting_on = Some(r.id);
                     hit_border = true;
@@ -864,6 +869,40 @@ mod tests {
             }
         }
         assert!(on_second > 50, "only {on_second}/400 spawns on the second monitor");
+    }
+
+    /// A monitor taller than its neighbour is centred against it, so Hyprland
+    /// places it at a negative y. Windows in its top band then have a negative
+    /// landing coordinate, which the "is the sheep on screen?" test used to
+    /// read as off screen and refuse — leaving the biggest window on the
+    /// monitor with no landable top edge at all.
+    #[test]
+    fn a_window_high_on_a_monitor_above_the_origin_is_landable() {
+        let p = pet();
+        // DP-2 as Hyprland reports it: 1440x2560 at (3840, -400).
+        let w = World {
+            screens: vec![Screen {
+                id: 0,
+                x: 3840.0,
+                y: -400.0,
+                w: 1440.0,
+                h: 2560.0,
+                reserved: (0.0, 0.0, 0.0, 0.0),
+            }],
+            windows: vec![Rect { id: 9, x: 3858.0, y: -26.0, w: 1404.0, h: 1242.0 }],
+        };
+        let mut s = Sheep::new(false);
+        let mut ev = Vec::new();
+        s.x = 4500.0;
+        s.y = -300.0;
+        for _ in 0..80 {
+            s.step(&p, &w, TILE, &mut ev);
+            if s.resting_on == Some(9) {
+                assert_eq!(s.y, -66.0, "landed, but not on the window's top edge");
+                return;
+            }
+        }
+        panic!("fell straight past a window at y={} (ended at y={})", -26.0, s.y);
     }
 
     #[test]
