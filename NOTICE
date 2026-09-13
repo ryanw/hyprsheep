@@ -1,0 +1,16 @@
+hyprsheep - a desktop sheep for Hyprland
+Copyright (C) 2026 Ryan Williams
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version. See LICENSE for the full text.
+
+Derived from web-esheep by Adriano Petrucci (GPL-3.0):
+    https://github.com/Adrianotiger/web-esheep
+
+The sprite sheet (assets/esheep-sprites.png) and the animation definitions in
+assets/animations.xml come from that project's `pets/original.xml`, which is in
+turn a recreation of the 1995 "eSheep" / stray sheep desktop pet. The animation
+data here has had its embedded base64 spritesheet and icon payloads stripped,
+since the sheet ships alongside it as a PNG; it is otherwise unmodified.
