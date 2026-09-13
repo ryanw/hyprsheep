@@ -703,6 +703,140 @@ mod tests {
         assert_eq!(short.screen(&w, TILE).floor(), 540.0);
     }
 
+    /// Starting in any animation must run without panicking or wedging.
+    #[test]
+    fn every_animation_can_be_entered_and_run() {
+        let p = pet();
+        let mut w = two_screens();
+        w.windows.push(Rect { id: 1, x: 200.0, y: 500.0, w: 700.0, h: 500.0 });
+        w.windows.push(Rect { id: 2, x: 1000.0, y: 42.0, w: 600.0, h: 900.0 });
+
+        for id in 1..=54u32 {
+            let mut s = Sheep::new(false);
+            let mut ev = Vec::new();
+            s.x = 600.0;
+            s.y = 300.0;
+            s.begin(&p, &w, TILE, id, &mut ev);
+            for _ in 0..3000 {
+                ev.clear();
+                let d = s.step(&p, &w, TILE, &mut ev);
+                assert!(d.as_millis() >= 10, "anim {id}: implausible delay {d:?}");
+                assert!(s.x.is_finite() && s.y.is_finite(), "anim {id}: position diverged");
+                assert!(p.get(s.animation).is_some(), "anim {id}: entered unknown animation");
+                assert!((0.0..=1.0).contains(&s.opacity), "anim {id}: opacity {}", s.opacity);
+            }
+        }
+    }
+
+    /// `drag` is entered only by the mouse, and `kill`/`sync` were driven by
+    /// Windows events the original had and we do not. Everything else must be
+    /// reachable by simply letting the sheep run.
+    #[test]
+    fn every_other_animation_is_reachable_from_a_spawn() {
+        let p = pet();
+        let mut seen = std::collections::HashSet::new();
+        let mut stack: Vec<u32> = p.spawns.iter().map(|s| s.next).collect();
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            let a = p.get(id).unwrap();
+            stack.extend(a.next.iter().chain(&a.border).chain(&a.gravity).map(|n| n.target));
+            stack.extend(p.children.iter().filter(|c| c.animation_id == id).map(|c| c.next));
+        }
+
+        let orphans: Vec<&str> = (1..=54u32)
+            .filter(|i| !seen.contains(i))
+            .map(|i| p.get(i).unwrap().name.as_str())
+            .collect();
+        assert_eq!(orphans, vec!["drag", "kill", "sync"], "reachability changed");
+        assert!(p.by_name("drag").is_some(), "drag must still be reachable by name");
+    }
+
+    /// The two rare spawn points start long chains, each of which brings on a
+    /// companion. They sit behind weights of 3 in 106, so ordinary play rarely
+    /// reaches them.
+    #[test]
+    fn the_rare_chains_run_their_course() {
+        let p = pet();
+        let w = world();
+        // batha brings on the bathtub and ends by rejoining ordinary life;
+        // blacksheepa brings on the second sheep.
+        for (start, companion, expected) in
+            [(21u32, 23u32, vec![22u32, 47, 48]), (28, 31, vec![29, 30])]
+        {
+            let mut s = Sheep::new(false);
+            let mut ev = Vec::new();
+            s.x = 800.0;
+            s.y = 1040.0;
+            s.begin(&p, &w, TILE, start, &mut ev);
+            assert!(
+                ev.iter().any(|e| matches!(e, Event::SpawnChild { animation, .. }
+                    if *animation == companion)),
+                "anim {start} should bring on companion {companion}, got {ev:?}"
+            );
+
+            let mut visited = std::collections::HashSet::new();
+            for _ in 0..40_000 {
+                s.step(&p, &w, TILE, &mut ev);
+                visited.insert(s.animation);
+            }
+            for id in expected {
+                assert!(visited.contains(&id), "chain from {start} never reached {id}");
+            }
+        }
+    }
+
+    /// Each companion runs its own short chain and then dies. The bathtub is
+    /// the clearest case: it fills, then stops for good.
+    #[test]
+    fn the_bathtub_fills_and_then_finishes() {
+        let p = pet();
+        let w = world();
+        let mut tub = Sheep::new(true);
+        let mut ev = Vec::new();
+        tub.x = 800.0;
+        tub.y = 1040.0;
+        tub.begin(&p, &w, TILE, 23, &mut ev);
+
+        let mut visited = std::collections::HashSet::new();
+        for _ in 0..40_000 {
+            ev.clear();
+            tub.step(&p, &w, TILE, &mut ev);
+            visited.insert(tub.animation);
+            if ev.contains(&Event::Died) {
+                assert!(visited.contains(&24), "tub died without reaching bathz");
+                return;
+            }
+        }
+        panic!("bathtub never finished (reached {visited:?})");
+    }
+
+    /// The companion sheep of the black-sheep encounter must run its own
+    /// chain and then die, rather than respawning like an ordinary sheep.
+    #[test]
+    fn the_companion_sheep_runs_its_chain_and_dies() {
+        let p = pet();
+        let w = world();
+        let mut child = Sheep::new(true);
+        let mut ev = Vec::new();
+        child.x = 700.0;
+        child.y = 1040.0;
+        child.begin(&p, &w, TILE, 31, &mut ev);
+
+        let mut visited = std::collections::HashSet::new();
+        for _ in 0..20_000 {
+            ev.clear();
+            child.step(&p, &w, TILE, &mut ev);
+            visited.insert(child.animation);
+            if ev.contains(&Event::Died) {
+                assert!(visited.len() > 1, "died without running its chain");
+                return;
+            }
+        }
+        panic!("companion never finished (reached {visited:?})");
+    }
+
     #[test]
     fn dragging_freezes_physics() {
         let p = pet();
