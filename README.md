@@ -6,6 +6,8 @@ The sheep wanders around your screen, walks along the top edges of your
 windows, climbs the sides, falls when the window it was standing on closes,
 and occasionally stops for a nap.
 
+![Screenshot of hyprsheep](assets/screenshot.png)
+
 ## Status
 
 Everything works: the overlay, the animation engine, window collision against
@@ -79,7 +81,8 @@ straddling the seam is drawn on both. Screen edges are only walls where no
 other monitor continues past them, and each monitor keeps its own floor, so a
 sheep that walks off a short screen onto a taller one falls.
 
-Each surface is anchored to all four with a negative exclusive zone so bars cannot displace it. Its input
+Each surface is anchored to all four edges, with a negative exclusive zone so
+bars cannot displace it. Its input
 region is narrowed to just the sheep, so they can be picked up and dragged
 while every other click falls straight through to the window underneath.
 
