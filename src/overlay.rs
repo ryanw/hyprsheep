@@ -35,6 +35,7 @@ use wayland_client::{
 };
 
 use crate::anim::Pet;
+use crate::config::Config;
 use crate::engine::{Event, Sheep, World};
 use crate::hypr;
 use crate::sprites::Sheet;
@@ -86,18 +87,22 @@ pub struct Overlay {
     panels: Vec<Panel>,
     sheet: Sheet,
     pet: Pet,
+    /// Sprite size. Tiles are not always a whole number of pixels, so the
+    /// sheet is sampled at the exact fraction and the sprite drawn rounded.
     tile: f64,
+    tile_h: f64,
     flock: Vec<Pen>,
 
     monitors: Vec<hypr::Monitor>,
     world: World,
+    cfg: Config,
     dirty: Arc<AtomicBool>,
     last_refresh: Instant,
     /// Log every animation change; set HYPRSHEEP_TRACE=1.
     trace: bool,
 }
 
-pub fn run(sheet: Sheet, pet: Pet) -> Result<(), String> {
+pub fn run(sheet: Sheet, pet: Pet, cfg: Config) -> Result<(), String> {
     let (monitors, world) = hypr::world()?;
     let dirty = Arc::new(AtomicBool::new(false));
     hypr::watch(dirty.clone());
@@ -112,7 +117,8 @@ pub fn run(sheet: Sheet, pet: Pet) -> Result<(), String> {
     let layer_shell =
         LayerShell::bind(&globals, &qh).map_err(|e| format!("wlr-layer-shell: {e}"))?;
     let shm = Shm::bind(&globals, &qh).map_err(|e| format!("wl_shm: {e}"))?;
-    let tile = (sheet.width / pet.tiles_x.max(1)) as f64;
+    let tile = sheet.width as f64 / pet.tiles_x.max(1) as f64;
+    let tile_h = sheet.height as f64 / pet.tiles_y.max(1) as f64;
 
     let mut overlay = Overlay {
         registry_state: RegistryState::new(&globals),
@@ -128,20 +134,28 @@ pub fn run(sheet: Sheet, pet: Pet) -> Result<(), String> {
         sheet,
         pet,
         tile,
+        tile_h,
         flock: Vec::new(),
         monitors,
         world,
+        cfg,
         dirty,
         last_refresh: Instant::now(),
         trace: std::env::var_os("HYPRSHEEP_TRACE").is_some(),
     };
 
-    // Outputs already present are announced during the first roundtrip.
+    // Outputs already present are announced during the first roundtrip, which
+    // calls new_output for each and gives it a panel.
     queue.roundtrip(&mut overlay).map_err(|e| format!("roundtrip: {e}"))?;
-    for output in overlay.output_state.outputs().collect::<Vec<_>>() {
-        overlay.add_panel(&qh, output);
+    if overlay.panels.is_empty() {
+        let available: Vec<&str> =
+            overlay.monitors.iter().map(|m| m.name.as_str()).collect();
+        return Err(format!(
+            "no usable outputs: the `monitors` setting matches none of {}",
+            if available.is_empty() { "any attached monitor".to_string() } else { available.join(", ") }
+        ));
     }
-    overlay.add_sheep(false, None);
+    overlay.top_up_flock();
 
     loop {
         queue.blocking_dispatch(&mut overlay).map_err(|e| format!("dispatch: {e}"))?;
@@ -159,6 +173,10 @@ impl Overlay {
         }
         let info = self.output_state.info(&output);
         let name = info.as_ref().and_then(|i| i.name.clone()).unwrap_or_default();
+        if !self.cfg.monitors.allows(&name) {
+            println!("hyprsheep: skipping {name}, not in the configured monitors");
+            return;
+        }
 
         let surface = self.compositor.create_surface(qh);
         let layer = self.layer_shell.create_layer_surface(
@@ -313,8 +331,14 @@ impl Overlay {
         }
         self.handle(events);
 
-        // The flock should never empty out; a lone sheep respawns itself.
-        if self.flock.is_empty() {
+        self.top_up_flock();
+    }
+
+    /// Keep the configured number of ordinary sheep on screen. Companions are
+    /// not counted: they come and go on their own.
+    fn top_up_flock(&mut self) {
+        let ordinary = self.flock.iter().filter(|p| !p.sheep.is_child).count();
+        for _ in ordinary..self.cfg.sheep {
             self.add_sheep(false, None);
         }
     }
@@ -352,7 +376,7 @@ impl Overlay {
         // Fully transparent everywhere except the sheep.
         canvas.fill(0);
 
-        let tile = self.tile as u32;
+        let tile = self.tile.round() as u32;
         let region = Region::new(&self.compositor).ok();
 
         for pen in &self.flock {
@@ -369,12 +393,15 @@ impl Overlay {
                 continue;
             }
 
-            if let Some(r) = &region {
-                r.add(lx.round() as i32, ly.round() as i32, tile as i32, tile as i32);
+            if self.cfg.draggable {
+                if let Some(r) = &region {
+                    r.add(lx.round() as i32, ly.round() as i32, tile as i32, tile as i32);
+                }
             }
 
             let (col, row) = (s.frame % self.pet.tiles_x, s.frame / self.pet.tiles_x);
-            let (sx0, sy0) = (col * tile, row * tile);
+            let sx0 = (col as f64 * self.tile).round() as u32;
+            let sy0 = (row as f64 * self.tile_h).round() as u32;
             let ox = lx.round() as i32 * scale;
             let oy = ly.round() as i32 * scale;
             let alpha = s.opacity.clamp(0.0, 1.0);
@@ -418,7 +445,8 @@ impl Overlay {
 
         let surface = panel.layer.wl_surface();
         // Restrict input to the sheep themselves: clicks anywhere else fall
-        // through to the window underneath.
+        // through to the window underneath. With dragging off nothing is added
+        // to the region, so the overlay stays entirely click-through.
         if let Some(r) = &region {
             surface.set_input_region(Some(r.wl_region()));
         }

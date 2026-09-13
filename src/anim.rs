@@ -172,6 +172,10 @@ pub struct Child {
 pub struct Pet {
     pub tiles_x: u32,
     pub tiles_y: u32,
+    /// The sprite sheet carried inside the file, if it has one. Pet files are
+    /// normally self-contained; the bundled one has its payload stripped since
+    /// the sheet ships beside it.
+    pub png: Option<Vec<u8>>,
     pub spawns: Vec<Spawn>,
     pub animations: HashMap<u32, Animation>,
     pub children: Vec<Child>,
@@ -241,6 +245,11 @@ impl Pet {
         let image = child(root, "image");
         let tiles_x = image.and_then(|n| text_of(n, "tilesx")).and_then(|t| t.parse().ok());
         let tiles_y = image.and_then(|n| text_of(n, "tilesy")).and_then(|t| t.parse().ok());
+        let png = image
+            .and_then(|n| child(n, "png"))
+            .and_then(|n| n.text())
+            .filter(|t| !t.trim().is_empty())
+            .and_then(decode_base64);
 
         let spawns = child(root, "spawns")
             .map(|n| children(n, "spawn").map(parse_spawn).collect())
@@ -266,11 +275,38 @@ impl Pet {
         Ok(Pet {
             tiles_x: tiles_x.unwrap_or(16),
             tiles_y: tiles_y.unwrap_or(11),
+            png,
             spawns,
             animations,
             children: child_list,
         })
     }
+}
+
+/// Decode standard base64, ignoring whitespace. Pet files embed the sprite
+/// sheet this way, sometimes wrapped in CDATA, which the XML parser unwraps.
+fn decode_base64(s: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(s.len() / 4 * 3);
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for c in s.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' => break,
+            c if c.is_ascii_whitespace() => continue,
+            _ => return None,
+        };
+        acc = (acc << 6) | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Some(out)
 }
 
 // -- parsing helpers; all matching is on local names, ignoring namespaces --
@@ -416,6 +452,23 @@ mod tests {
         for id in 1..=54u32 {
             assert!(p.get(id).is_some(), "missing animation {id}");
         }
+    }
+
+    #[test]
+    fn the_bundled_pet_has_no_embedded_sheet() {
+        // Its payload is stripped because the sheet ships as a PNG beside it.
+        assert!(pet().png.is_none());
+    }
+
+    #[test]
+    fn base64_decoding_round_trips() {
+        // "sheep" and a PNG magic number, the latter with embedded whitespace
+        // as the pet files actually store it.
+        assert_eq!(decode_base64("c2hlZXA=").unwrap(), b"sheep");
+        assert_eq!(decode_base64("aVZCT1J3MEtHZ28=").unwrap(), b"iVBORw0KGgo");
+        assert_eq!(decode_base64("c2hl\n  ZXA=").unwrap(), b"sheep");
+        assert_eq!(decode_base64("").unwrap(), b"");
+        assert!(decode_base64("not*valid").is_none());
     }
 
     #[test]

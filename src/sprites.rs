@@ -12,7 +12,13 @@ pub struct Sheet {
 
 impl Sheet {
     pub fn load(bytes: &[u8]) -> Result<Self, String> {
-        let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+        let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+        // Pet sheets come in whatever the author saved: palette-indexed,
+        // greyscale, RGB or RGBA. Ask the decoder to expand the lot and give
+        // us an alpha channel, so the blit only ever sees one layout.
+        decoder.set_transformations(
+            png::Transformations::EXPAND | png::Transformations::ALPHA,
+        );
         let mut reader = decoder.read_info().map_err(|e| format!("png header: {e}"))?;
         let mut buf = vec![0; reader.output_buffer_size().unwrap_or(0)];
         let info = reader.next_frame(&mut buf).map_err(|e| format!("png data: {e}"))?;
@@ -25,10 +31,15 @@ impl Sheet {
         let px = &buf[..info.buffer_size()];
         let pixels = match info.color_type {
             png::ColorType::Rgba => px.to_vec(),
-            png::ColorType::Rgb => px
-                .chunks_exact(3)
-                .flat_map(|c| [c[0], c[1], c[2], 0xFF])
-                .collect(),
+            png::ColorType::Rgb => {
+                px.chunks_exact(3).flat_map(|c| [c[0], c[1], c[2], 0xFF]).collect()
+            }
+            png::ColorType::GrayscaleAlpha => {
+                px.chunks_exact(2).flat_map(|c| [c[0], c[0], c[0], c[1]]).collect()
+            }
+            png::ColorType::Grayscale => {
+                px.iter().flat_map(|&g| [g, g, g, 0xFF]).collect()
+            }
             other => return Err(format!("unsupported png colour type {other:?}")),
         };
 

@@ -18,11 +18,31 @@ monitors.
 cargo run --release
 ```
 
-Set `HYPRSHEEP_TRACE=1` to log each animation change, where the sheep is, and
-which window it is standing on.
+Run with `--trace` (or set `HYPRSHEEP_TRACE=1`) to log each animation change,
+where the sheep is, and which window it is standing on. `--help` lists the
+options.
 
-There is nothing to configure and no data files to install; the sprite sheet
-and the animation definitions are baked into the binary.
+Nothing needs installing: the sprite sheet and the animation definitions are
+baked into the binary.
+
+## Configuration
+
+Optional, and only if you want it. `~/.config/hyprsheep/config.toml`:
+
+```toml
+sheep     = 1      # how many sheep to keep on screen
+monitors  = "all"  # "all", one name, or ["eDP-1", "HDMI-A-1"]
+draggable = true   # whether the sheep can be picked up with the mouse
+# pet     = "~/pets/green_sheep.xml"
+```
+
+A bad line is reported and its default kept, so a typo cannot leave you
+without a sheep. With `draggable = false` the overlay is click-through
+everywhere, with no region for the pointer to catch on.
+
+`pet` loads an alternative pet in the same XML format, sprite sheet and all -
+these files are self-contained. The green sheep that ships with web-esheep
+works, for instance, and brings 186 animations with it.
 
 ## How it works
 
