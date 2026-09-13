@@ -74,20 +74,45 @@ impl Monitor {
 pub fn monitors() -> Result<Vec<Monitor>, String> {
     let v = query("j/monitors")?;
     let list = v.as_array().ok_or("monitors: expected an array")?;
-    let mut out: Vec<Monitor> = list
+    let mut out = monitors_from(list);
+
+    let focused = list
         .iter()
+        .position(|m| m.get("focused").and_then(Value::as_bool).unwrap_or(false));
+    if let Some(i) = focused {
+        out.swap(0, i);
+    }
+    if out.is_empty() {
+        return Err("no enabled monitors".into());
+    }
+    Ok(out)
+}
+
+/// Map the enabled entries of a `j/monitors` reply into the global logical
+/// space every other coordinate is already in.
+fn monitors_from(list: &[Value]) -> Vec<Monitor> {
+    list.iter()
         .filter(|m| !m.get("disabled").and_then(Value::as_bool).unwrap_or(false))
         .map(|m| {
-            // width/height are physical pixels; everything else Hyprland
-            // reports, and everything we draw, is logical.
+            // width/height are the *mode's* physical pixels, before both the
+            // scale and the transform: a 2560x1440 panel hung sideways is
+            // still reported 2560x1440, though it occupies 1440x2560 of the
+            // layout. Everything else Hyprland reports — x/y, and every
+            // window's `at` and `size` — is post-transform logical space, so
+            // the monitor is the one thing that has to be turned to match.
             let scale = f(m, "scale").max(0.01);
+            let transform = m.get("transform").and_then(Value::as_i64).unwrap_or(0);
+            let (mw, mh) = (f(m, "width") / scale, f(m, "height") / scale);
+            // The rotated transforms are the odd ones, flipped or not: 1 (90°),
+            // 3 (270°), 5 (flipped 90°) and 7 (flipped 270°).
+            let (width, height) = if transform % 2 == 1 { (mh, mw) } else { (mw, mh) };
             Monitor {
                 id: m.get("id").and_then(Value::as_i64).unwrap_or(0),
                 name: m.get("name").and_then(Value::as_str).unwrap_or_default().to_string(),
                 x: f(m, "x"),
                 y: f(m, "y"),
-                width: f(m, "width") / scale,
-                height: f(m, "height") / scale,
+                width,
+                height,
                 reserved: (
                     at(m, "reserved", 0),
                     at(m, "reserved", 1),
@@ -101,18 +126,7 @@ pub fn monitors() -> Result<Vec<Monitor>, String> {
                     .unwrap_or(-1),
             }
         })
-        .collect();
-
-    let focused = list
-        .iter()
-        .position(|m| m.get("focused").and_then(Value::as_bool).unwrap_or(false));
-    if let Some(i) = focused {
-        out.swap(0, i);
-    }
-    if out.is_empty() {
-        return Err("no enabled monitors".into());
-    }
-    Ok(out)
+        .collect()
 }
 
 /// Build the sheep's world: every monitor, and every window visible on one.
@@ -195,4 +209,54 @@ pub fn watch(dirty: Arc<AtomicBool>) {
             dirty.store(true, Ordering::Relaxed);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(json: &str) -> Monitor {
+        let v: Value = serde_json::from_str(json).unwrap();
+        // The same mapping `monitors()` applies to each entry.
+        monitors_from(&[v]).pop().unwrap()
+    }
+
+    #[test]
+    fn an_upright_monitor_keeps_its_mode() {
+        let m = parse(
+            r#"{ "id": 1, "name": "DP-3", "x": 0, "y": 0, "width": 3840,
+                 "height": 1600, "scale": 1.0, "transform": 0 }"#,
+        );
+        assert_eq!((m.width, m.height), (3840.0, 1600.0));
+    }
+
+    /// Hyprland reports the mode either way round; only `transform` says which
+    /// way up the panel is hung. Untransformed, the sheep were given a screen
+    /// 2560 wide and 1440 tall for one that is really 1440 by 2560 — so they
+    /// walked a floor half way down it and an edge past the right of it.
+    #[test]
+    fn a_rotated_monitor_is_turned_to_match_the_layout() {
+        for transform in [1, 3, 5, 7] {
+            let m = parse(&format!(
+                r#"{{ "width": 2560, "height": 1440, "scale": 1.0,
+                      "transform": {transform} }}"#
+            ));
+            assert_eq!((m.width, m.height), (1440.0, 2560.0), "transform {transform}");
+        }
+        for transform in [0, 2, 4, 6] {
+            let m = parse(&format!(
+                r#"{{ "width": 2560, "height": 1440, "scale": 1.0,
+                      "transform": {transform} }}"#
+            ));
+            assert_eq!((m.width, m.height), (2560.0, 1440.0), "transform {transform}");
+        }
+    }
+
+    #[test]
+    fn scale_applies_before_the_swap() {
+        let m = parse(
+            r#"{ "width": 2560, "height": 1440, "scale": 2.0, "transform": 3 }"#,
+        );
+        assert_eq!((m.width, m.height), (720.0, 1280.0));
+    }
 }
