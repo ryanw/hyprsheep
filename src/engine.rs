@@ -32,21 +32,68 @@ impl Rect {
     }
 }
 
+/// One monitor, placed in the global coordinate space.
+#[derive(Clone, Copy, Debug)]
+pub struct Screen {
+    pub id: i64,
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+    /// Space claimed by bars: left, top, right, bottom.
+    pub reserved: (f64, f64, f64, f64),
+}
+
+impl Screen {
+    pub fn right(&self) -> f64 {
+        self.x + self.w
+    }
+    pub fn bottom(&self) -> f64 {
+        self.y + self.h
+    }
+    /// Global y of the walkable floor: the bottom, minus any bottom bar.
+    pub fn floor(&self) -> f64 {
+        self.bottom() - self.reserved.3
+    }
+    fn contains(&self, x: f64, y: f64) -> bool {
+        x >= self.x && x < self.right() && y >= self.y && y < self.bottom()
+    }
+}
+
 /// Everything outside the sheep that it can collide with.
+///
+/// All coordinates are global: monitors are rectangles laid out in one space,
+/// which is what lets a sheep walk off one screen and onto the next.
 #[derive(Clone, Debug, Default)]
 pub struct World {
-    pub screen_w: f64,
-    pub screen_h: f64,
-    /// Work area, i.e. the screen minus space reserved by bars.
-    pub area_w: f64,
-    pub area_h: f64,
-    /// Walkable window edges, nearest-to-front first.
+    pub screens: Vec<Screen>,
+    /// Walkable window edges, highest first.
     pub windows: Vec<Rect>,
 }
 
 impl World {
     fn find(&self, id: u64) -> Option<&Rect> {
         self.windows.iter().find(|r| r.id == id)
+    }
+
+    /// The screen containing a point, if any.
+    pub fn screen_at(&self, x: f64, y: f64) -> Option<&Screen> {
+        self.screens.iter().find(|s| s.contains(x, y))
+    }
+
+    /// The screen a point belongs to, falling back to the nearest one so the
+    /// sheep always has somewhere to be even in a gap between monitors.
+    pub fn screen_for(&self, x: f64, y: f64) -> Option<&Screen> {
+        self.screen_at(x, y).or_else(|| {
+            self.screens.iter().min_by(|a, b| {
+                let d = |s: &Screen| {
+                    let cx = x.clamp(s.x, s.right());
+                    let cy = y.clamp(s.y, s.bottom());
+                    (x - cx).powi(2) + (y - cy).powi(2)
+                };
+                d(a).total_cmp(&d(b))
+            })
+        })
     }
 }
 
@@ -107,19 +154,41 @@ impl Sheep {
         }
     }
 
-    fn ctx(&self, world: &World, pet: &Pet, tile: f64) -> Ctx {
-        let _ = pet;
+    /// The screen the sheep is currently on.
+    pub fn screen(&self, world: &World, tile: f64) -> Screen {
+        world
+            .screen_for(self.x + tile / 2.0, self.y + tile / 2.0)
+            .copied()
+            .unwrap_or(Screen {
+                id: -1,
+                x: 0.0,
+                y: 0.0,
+                w: 0.0,
+                h: 0.0,
+                reserved: (0.0, 0.0, 0.0, 0.0),
+            })
+    }
+
+    /// Expressions are written for a single screen with its origin at the top
+    /// left, so they are evaluated in screen-local coordinates and the results
+    /// translated back into the global space.
+    fn ctx_on(&self, screen: &Screen, tile: f64) -> Ctx {
         Ctx {
-            screen_w: world.screen_w,
-            screen_h: world.screen_h,
-            area_w: world.area_w,
-            area_h: world.area_h,
+            screen_w: screen.w,
+            screen_h: screen.h,
+            area_w: screen.w - screen.reserved.0 - screen.reserved.2,
+            area_h: screen.h - screen.reserved.3,
             image_w: tile,
             image_h: tile,
-            image_x: self.x,
-            image_y: self.y,
+            image_x: self.x - screen.x,
+            image_y: self.y - screen.y,
             rand_s: self.rand_s,
         }
+    }
+
+    fn ctx(&self, world: &World, pet: &Pet, tile: f64) -> Ctx {
+        let _ = pet;
+        self.ctx_on(&self.screen(world, tile), tile)
     }
 
     /// Enter `id`, resetting the sequence and spawning any companion it declares.
@@ -129,12 +198,14 @@ impl Sheep {
         let ctx = self.ctx(world, pet, tile);
         self.steps = pet.get(id).map(|a| a.steps(&ctx)).unwrap_or(1);
 
+        let screen = self.screen(world, tile);
         for c in pet.children.iter().filter(|c| c.animation_id == id) {
             events.push(Event::SpawnChild {
                 animation: c.next,
-                // Child coordinates are evaluated against the *parent's* state.
-                x: eval_or(&c.x, &ctx, 0.0),
-                y: eval_or(&c.y, &ctx, 0.0),
+                // Child coordinates are evaluated against the *parent's* state,
+                // in the parent's screen-local space.
+                x: screen.x + eval_or(&c.x, &ctx, 0.0),
+                y: screen.y + eval_or(&c.y, &ctx, 0.0),
             });
         }
     }
@@ -154,9 +225,14 @@ impl Sheep {
     pub fn spawn(&mut self, pet: &Pet, world: &World, tile: f64, events: &mut Vec<Event>) {
         let Some(spawn) = pet.choose_spawn() else { return };
         let (x, y, next) = (spawn.x.clone(), spawn.y.clone(), spawn.next);
-        let ctx = self.ctx(world, pet, tile);
-        self.x = eval_or(&x, &ctx, 0.0);
-        self.y = eval_or(&y, &ctx, 0.0);
+        // Pick a monitor to arrive on, so the sheep turns up on either screen.
+        let screen = match world.screens.len() {
+            0 => self.screen(world, tile),
+            n => world.screens[fastrand::usize(..n)],
+        };
+        let ctx = self.ctx_on(&screen, tile);
+        self.x = screen.x + eval_or(&x, &ctx, 0.0);
+        self.y = screen.y + eval_or(&y, &ctx, 0.0);
         self.flipped = false;
         self.resting_on = None;
         self.enter(pet, world, tile, next, events);
@@ -290,22 +366,32 @@ impl Sheep {
         }
 
         // 2. Borders: screen edges and window tops. Which edge matters depends
-        //    on the direction of travel, exactly as the original does it.
+        //    on the direction of travel, exactly as the original does it. An
+        //    edge with another monitor behind it is not an edge at all - the
+        //    sheep walks straight across the seam.
         let mut hit_border = false;
-        let floor = world.area_h - tile;
-        if x2 < 0.0 && self.x < 0.0 {
-            self.x = 0.0;
+        let screen = self.screen(world, tile);
+        let floor = screen.floor() - tile;
+        let mid_y = self.y + tile / 2.0;
+        let mid_x = self.x + tile / 2.0;
+        let continues = |x: f64, y: f64| world.screen_at(x, y).is_some();
+
+        if x2 < 0.0 && self.x < screen.x && !continues(self.x - 1.0, mid_y) {
+            self.x = screen.x;
             hit_border = true;
             self.situation.on_vertical = true;
-        } else if x2 > 0.0 && self.x > world.screen_w - tile {
-            self.x = world.screen_w - tile;
+        } else if x2 > 0.0
+            && self.x > screen.right() - tile
+            && !continues(self.x + tile + 1.0, mid_y)
+        {
+            self.x = screen.right() - tile;
             hit_border = true;
             self.situation.on_vertical = true;
-        } else if y2 < 0.0 && self.y < 0.0 {
-            self.y = 0.0;
+        } else if y2 < 0.0 && self.y < screen.y && !continues(mid_x, self.y - 1.0) {
+            self.y = screen.y;
             hit_border = true;
             self.situation.on_horizontal = true;
-        } else if y2 > 0.0 && self.y > floor {
+        } else if y2 > 0.0 && self.y > floor && !continues(mid_x, self.y + tile + 1.0) {
             self.y = floor;
             self.resting_on = None;
             hit_border = true;
@@ -376,12 +462,13 @@ impl Sheep {
     }
 
     fn update_situation(&mut self, world: &World, tile: f64) {
-        let floor = world.area_h - tile;
+        let screen = self.screen(world, tile);
+        let floor = screen.floor() - tile;
         self.situation = Situation {
             on_window: self.resting_on.is_some(),
             on_taskbar: self.y >= floor - 2.0,
-            on_vertical: self.x <= 0.0 || self.x >= world.screen_w - tile,
-            on_horizontal: self.y <= 0.0 || self.y >= floor - 2.0,
+            on_vertical: self.x <= screen.x || self.x >= screen.right() - tile,
+            on_horizontal: self.y <= screen.y || self.y >= floor - 2.0,
         };
     }
 }
@@ -397,12 +484,18 @@ mod tests {
         Pet::parse(XML).unwrap()
     }
 
+    fn screen(id: i64, x: f64, w: f64, h: f64) -> Screen {
+        Screen { id, x, y: 0.0, w, h, reserved: (0.0, 0.0, 0.0, 0.0) }
+    }
+
     fn world() -> World {
+        World { screens: vec![screen(0, 0.0, 1920.0, 1080.0)], windows: vec![] }
+    }
+
+    /// Two monitors side by side, the second narrower.
+    fn two_screens() -> World {
         World {
-            screen_w: 1920.0,
-            screen_h: 1080.0,
-            area_w: 1920.0,
-            area_h: 1080.0,
+            screens: vec![screen(0, 0.0, 1920.0, 1080.0), screen(1, 1920.0, 960.0, 1080.0)],
             windows: vec![],
         }
     }
@@ -499,6 +592,115 @@ mod tests {
             }
         }
         panic!("sheep kept standing on a window that closed (y={})", s.y);
+    }
+
+    #[test]
+    fn walks_across_the_seam_onto_the_next_monitor() {
+        let p = pet();
+        let w = two_screens();
+        let mut s = Sheep::new(false);
+        let mut ev = Vec::new();
+        // On the floor near the right edge of the first monitor, facing right.
+        s.x = 1900.0;
+        s.y = 1040.0;
+        s.flipped = true;
+        s.begin(&p, &w, TILE, 1, &mut ev);
+
+        for _ in 0..200 {
+            s.step(&p, &w, TILE, &mut ev);
+            if s.x > 1960.0 {
+                assert_eq!(s.screen(&w, TILE).id, 1, "should now be on the second monitor");
+                return;
+            }
+            // It must never be clamped to the inner edge: that edge is not a wall.
+            assert!(s.x >= 1880.0 || s.animation != 1, "clamped at the seam (x={})", s.x);
+        }
+        panic!("never crossed the seam (ended at x={}, anim {})", s.x, s.animation);
+    }
+
+    #[test]
+    fn the_outer_edge_is_still_a_wall() {
+        let p = pet();
+        let w = two_screens();
+        let mut s = Sheep::new(false);
+        let mut ev = Vec::new();
+        // Far right of the second monitor, walking further right.
+        s.x = 2820.0;
+        s.y = 1040.0;
+        s.flipped = true;
+        s.begin(&p, &w, TILE, 1, &mut ev);
+
+        for _ in 0..400 {
+            s.step(&p, &w, TILE, &mut ev);
+            assert!(s.x <= 2840.0, "sheep walked off the right of the desktop (x={})", s.x);
+        }
+    }
+
+    #[test]
+    fn a_gap_below_an_adjacent_monitor_is_a_wall() {
+        let p = pet();
+        // The second monitor is short, so the floor of the first has nothing
+        // beside it; the sheep must not walk into the void.
+        let w = World {
+            screens: vec![screen(0, 0.0, 1920.0, 1080.0), screen(1, 1920.0, 960.0, 540.0)],
+            windows: vec![],
+        };
+        let mut s = Sheep::new(false);
+        let mut ev = Vec::new();
+        s.x = 1900.0;
+        s.y = 1040.0;
+        s.flipped = true;
+        s.begin(&p, &w, TILE, 1, &mut ev);
+
+        for _ in 0..300 {
+            s.step(&p, &w, TILE, &mut ev);
+            assert!(s.x <= 1880.0, "sheep walked off into the gap (x={})", s.x);
+        }
+    }
+
+    #[test]
+    fn expressions_are_evaluated_per_screen() {
+        let p = pet();
+        let w = two_screens();
+        // Spawning many times must always place the sheep near some monitor,
+        // never at a coordinate derived from the wrong one.
+        let mut on_second = 0;
+        for _ in 0..400 {
+            let mut s = Sheep::new(false);
+            let mut ev = Vec::new();
+            s.spawn(&p, &w, TILE, &mut ev);
+            let sc = s.screen(&w, TILE);
+            // Spawns sit at or just outside an edge of their own monitor.
+            assert!(
+                s.x >= sc.x - TILE * 2.0 && s.x <= sc.right() + TILE * 2.0,
+                "spawned at x={} for monitor at {}..{}",
+                s.x,
+                sc.x,
+                sc.right()
+            );
+            assert!(s.y <= sc.bottom(), "spawned below monitor bottom: y={}", s.y);
+            if sc.id == 1 {
+                on_second += 1;
+            }
+        }
+        assert!(on_second > 50, "only {on_second}/400 spawns on the second monitor");
+    }
+
+    #[test]
+    fn each_screen_has_its_own_floor() {
+        let w = World {
+            screens: vec![screen(0, 0.0, 1920.0, 1080.0), screen(1, 1920.0, 960.0, 540.0)],
+            windows: vec![],
+        };
+        let mut tall = Sheep::new(false);
+        tall.x = 100.0;
+        tall.y = 100.0;
+        assert_eq!(tall.screen(&w, TILE).floor(), 1080.0);
+
+        let mut short = Sheep::new(false);
+        short.x = 2000.0;
+        short.y = 100.0;
+        assert_eq!(short.screen(&w, TILE).floor(), 540.0);
     }
 
     #[test]

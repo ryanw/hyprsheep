@@ -1,4 +1,9 @@
-//! Fullscreen, click-through wlr-layer-shell overlay that the sheep live on.
+//! Click-through wlr-layer-shell overlays, one per output, that the sheep
+//! live on.
+//!
+//! The sheep exist in a single global coordinate space spanning every monitor;
+//! each panel draws whichever of them overlap its own output, so a sheep
+//! crossing the seam is simply drawn on both.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -34,11 +39,11 @@ use crate::engine::{Event, Sheep, World};
 use crate::hypr;
 use crate::sprites::Sheet;
 
+/// Linux input code for the left mouse button.
+const BTN_LEFT: u32 = 0x110;
 /// How often to re-read the window layout even without an event, so that
 /// interactive drags and resizes are followed smoothly.
 const REFRESH: Duration = Duration::from_millis(200);
-/// Linux input code for the left mouse button.
-const BTN_LEFT: u32 = 0x110;
 /// Guard against a burst of catch-up steps after the compositor stalls us.
 const MAX_STEPS_PER_FRAME: usize = 8;
 
@@ -50,32 +55,41 @@ struct Pen {
     traced: (u32, u32),
 }
 
-pub struct Overlay {
-    registry_state: RegistryState,
-    output_state: OutputState,
-    seat_state: SeatState,
-    pointer: Option<wl_pointer::WlPointer>,
-    /// Index of the sheep the pointer is pressed on, if any.
-    pressed: Option<usize>,
-    shm: Shm,
-    pool: SlotPool,
+/// One output's overlay surface.
+struct Panel {
+    output: wl_output::WlOutput,
+    /// Connector name, used to match this output to a Hyprland monitor.
+    name: String,
     layer: LayerSurface,
-    compositor: CompositorState,
-
-    /// Logical size of the overlay, as configured by the compositor.
+    pool: SlotPool,
+    /// Logical size, as configured by the compositor.
     width: u32,
     height: u32,
     /// Output scale; the shm buffer is this many times larger.
     scale: u32,
-    configured: bool,
+    /// Global logical position of this output's top-left corner.
+    origin: (f64, f64),
+}
+
+pub struct Overlay {
+    registry_state: RegistryState,
+    output_state: OutputState,
+    seat_state: SeatState,
+    shm: Shm,
+    compositor: CompositorState,
+    layer_shell: LayerShell,
+    pointer: Option<wl_pointer::WlPointer>,
+    /// Index of the sheep the pointer is pressed on, if any.
+    pressed: Option<usize>,
     pub exit: bool,
 
+    panels: Vec<Panel>,
     sheet: Sheet,
     pet: Pet,
     tile: f64,
     flock: Vec<Pen>,
 
-    monitor: hypr::Monitor,
+    monitors: Vec<hypr::Monitor>,
     world: World,
     dirty: Arc<AtomicBool>,
     last_refresh: Instant,
@@ -84,7 +98,7 @@ pub struct Overlay {
 }
 
 pub fn run(sheet: Sheet, pet: Pet) -> Result<(), String> {
-    let (monitor, world) = hypr::current()?;
+    let (monitors, world) = hypr::world()?;
     let dirty = Arc::new(AtomicBool::new(false));
     hypr::watch(dirty.clone());
 
@@ -98,55 +112,35 @@ pub fn run(sheet: Sheet, pet: Pet) -> Result<(), String> {
     let layer_shell =
         LayerShell::bind(&globals, &qh).map_err(|e| format!("wlr-layer-shell: {e}"))?;
     let shm = Shm::bind(&globals, &qh).map_err(|e| format!("wl_shm: {e}"))?;
-
-    let surface = compositor.create_surface(&qh);
-    let layer =
-        layer_shell.create_layer_surface(&qh, surface, Layer::Overlay, Some("hyprsheep"), None);
-
-    // Anchoring to all four edges with a zero size asks the compositor for the
-    // full output. A negative exclusive zone means bars don't push us around,
-    // so the sheep can reach every pixel of the screen.
-    layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
-    layer.set_size(0, 0);
-    layer.set_exclusive_zone(-1);
-    layer.set_keyboard_interactivity(KeyboardInteractivity::None);
-
-    // Start fully click-through; once there are sheep on screen the region is
-    // narrowed to just their sprites so everything else still falls through.
-    let empty = Region::new(&compositor).map_err(|e| format!("wl_region: {e}"))?;
-    layer.wl_surface().set_input_region(Some(empty.wl_region()));
-
-    layer.commit();
-
-    let pool = SlotPool::new(256 * 256 * 4, &shm).map_err(|e| format!("shm pool: {e}"))?;
     let tile = (sheet.width / pet.tiles_x.max(1)) as f64;
 
     let mut overlay = Overlay {
         registry_state: RegistryState::new(&globals),
         output_state: OutputState::new(&globals, &qh),
         seat_state: SeatState::new(&globals, &qh),
+        shm,
+        compositor,
+        layer_shell,
         pointer: None,
         pressed: None,
-        shm,
-        pool,
-        layer,
-        compositor,
-        width: 0,
-        height: 0,
-        scale: 1,
-        configured: false,
         exit: false,
+        panels: Vec::new(),
         sheet,
         pet,
         tile,
         flock: Vec::new(),
-        monitor,
+        monitors,
         world,
         dirty,
         last_refresh: Instant::now(),
         trace: std::env::var_os("HYPRSHEEP_TRACE").is_some(),
     };
 
+    // Outputs already present are announced during the first roundtrip.
+    queue.roundtrip(&mut overlay).map_err(|e| format!("roundtrip: {e}"))?;
+    for output in overlay.output_state.outputs().collect::<Vec<_>>() {
+        overlay.add_panel(&qh, output);
+    }
     overlay.add_sheep(false, None);
 
     loop {
@@ -158,6 +152,66 @@ pub fn run(sheet: Sheet, pet: Pet) -> Result<(), String> {
 }
 
 impl Overlay {
+    /// Give an output its own overlay surface.
+    fn add_panel(&mut self, qh: &QueueHandle<Self>, output: wl_output::WlOutput) {
+        if self.panels.iter().any(|p| p.output == output) {
+            return;
+        }
+        let info = self.output_state.info(&output);
+        let name = info.as_ref().and_then(|i| i.name.clone()).unwrap_or_default();
+
+        let surface = self.compositor.create_surface(qh);
+        let layer = self.layer_shell.create_layer_surface(
+            qh,
+            surface,
+            Layer::Overlay,
+            Some("hyprsheep"),
+            Some(&output),
+        );
+
+        // Anchoring to all four edges with a zero size asks the compositor for
+        // the full output. A negative exclusive zone means bars don't push us
+        // around, so the sheep can reach every pixel of the screen.
+        layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
+        layer.set_size(0, 0);
+        layer.set_exclusive_zone(-1);
+        layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+
+        // Start fully click-through; the region is narrowed to the sheep once
+        // there are any on this output.
+        if let Ok(empty) = Region::new(&self.compositor) {
+            layer.wl_surface().set_input_region(Some(empty.wl_region()));
+        }
+        layer.commit();
+
+        let pool = match SlotPool::new(256 * 256 * 4, &self.shm) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("hyprsheep: shm pool for {name}: {e}");
+                return;
+            }
+        };
+
+        let origin = self
+            .monitors
+            .iter()
+            .find(|m| m.name == name)
+            .map(|m| (m.x, m.y))
+            .unwrap_or((0.0, 0.0));
+
+        println!("hyprsheep: overlay on {name} at ({}, {})", origin.0, origin.1);
+        self.panels.push(Panel {
+            output,
+            name,
+            layer,
+            pool,
+            width: 0,
+            height: 0,
+            scale: 1,
+            origin,
+        });
+    }
+
     fn add_sheep(&mut self, is_child: bool, start: Option<(u32, f64, f64)>) {
         let mut sheep = Sheep::new(is_child);
         let mut events = Vec::new();
@@ -183,22 +237,28 @@ impl Overlay {
         }
     }
 
-    /// Re-read the window layout when an event says it may have changed, or
-    /// periodically to follow an in-progress drag.
+    /// Re-read the monitor layout and windows when an event says they may have
+    /// changed, or periodically to follow an in-progress drag.
     fn refresh_world(&mut self) {
-        let due = self.dirty.swap(false, Ordering::Relaxed)
-            || self.last_refresh.elapsed() >= REFRESH;
+        let due =
+            self.dirty.swap(false, Ordering::Relaxed) || self.last_refresh.elapsed() >= REFRESH;
         if !due {
             return;
         }
         self.last_refresh = Instant::now();
 
-        if let Ok(m) = hypr::refresh_monitor(self.monitor.id) {
-            self.monitor = m;
-        }
-        match hypr::snapshot(&self.monitor) {
-            Ok(w) => self.world = w,
-            Err(e) => eprintln!("hyprsheep: window query failed: {e}"),
+        match hypr::world() {
+            Ok((monitors, world)) => {
+                self.monitors = monitors;
+                self.world = world;
+                // A monitor may have been moved or rescaled underneath us.
+                for panel in &mut self.panels {
+                    if let Some(m) = self.monitors.iter().find(|m| m.name == panel.name) {
+                        panel.origin = (m.x, m.y);
+                    }
+                }
+            }
+            Err(e) => eprintln!("hyprsheep: layout query failed: {e}"),
         }
     }
 
@@ -220,16 +280,14 @@ impl Overlay {
             if steps == MAX_STEPS_PER_FRAME && now > pen.next_step {
                 pen.next_step = now;
             }
+
             let restarted = pen.sheep.animation != pen.traced.0 || pen.sheep.step < pen.traced.1;
             if self.trace && restarted {
                 pen.traced = (pen.sheep.animation, pen.sheep.step);
-                let name = self
-                    .pet
-                    .get(pen.sheep.animation)
-                    .map(|a| a.name.as_str())
-                    .unwrap_or("?");
+                let name =
+                    self.pet.get(pen.sheep.animation).map(|a| a.name.as_str()).unwrap_or("?");
                 println!(
-                    "{:>3} {:<18} at ({:>5.0},{:>5.0}) {}{}",
+                    "{:>3} {:<18} at ({:>6.0},{:>5.0}) {}{}",
                     pen.sheep.animation,
                     name,
                     pen.sheep.x,
@@ -243,6 +301,7 @@ impl Overlay {
             } else if self.trace {
                 pen.traced.1 = pen.sheep.step;
             }
+
             if events.contains(&Event::Died) {
                 dead.push(i);
             }
@@ -260,46 +319,29 @@ impl Overlay {
         }
     }
 
-    /// Restrict input to the sheep themselves: clicks anywhere else fall
-    /// through to the window underneath, but the sheep can be picked up.
-    fn update_input_region(&mut self) {
-        let Ok(region) = Region::new(&self.compositor) else { return };
-        let tile = self.tile as i32;
-        for pen in &self.flock {
-            region.add(
-                pen.sheep.x.round() as i32,
-                (pen.sheep.y + pen.sheep.offset_y).round() as i32,
-                tile,
-                tile,
-            );
-        }
-        self.layer.wl_surface().set_input_region(Some(region.wl_region()));
-    }
-
-    /// The topmost sheep whose sprite covers a surface-local point.
+    /// The topmost sheep whose sprite covers a global point.
     fn sheep_at(&self, x: f64, y: f64) -> Option<usize> {
         self.flock.iter().rposition(|pen| {
             let top = pen.sheep.y + pen.sheep.offset_y;
-            x >= pen.sheep.x
-                && x < pen.sheep.x + self.tile
-                && y >= top
-                && y < top + self.tile
+            x >= pen.sheep.x && x < pen.sheep.x + self.tile && y >= top && y < top + self.tile
         })
     }
 
-    fn draw(&mut self, qh: &QueueHandle<Self>) {
-        if self.width == 0 || self.height == 0 {
-            return;
-        }
+    fn draw(&mut self, qh: &QueueHandle<Self>, index: usize) {
         self.tick();
 
-        let scale = self.scale as i32;
-        let bw = self.width as i32 * scale;
-        let bh = self.height as i32 * scale;
+        let Some(panel) = self.panels.get_mut(index) else { return };
+        if panel.width == 0 || panel.height == 0 {
+            return;
+        }
+
+        let scale = panel.scale as i32;
+        let bw = panel.width as i32 * scale;
+        let bh = panel.height as i32 * scale;
         let stride = bw * 4;
 
         let (buffer, canvas) =
-            match self.pool.create_buffer(bw, bh, stride, wl_shm::Format::Argb8888) {
+            match panel.pool.create_buffer(bw, bh, stride, wl_shm::Format::Argb8888) {
                 Ok(v) => v,
                 Err(e) => {
                     eprintln!("hyprsheep: buffer alloc failed: {e}");
@@ -311,13 +353,30 @@ impl Overlay {
         canvas.fill(0);
 
         let tile = self.tile as u32;
+        let region = Region::new(&self.compositor).ok();
+
         for pen in &self.flock {
             let s = &pen.sheep;
-            let frame = s.frame;
-            let (col, row) = (frame % self.pet.tiles_x, frame / self.pet.tiles_x);
+            // Global position translated into this output's own space; a sheep
+            // straddling two outputs is drawn on both and clipped by each.
+            let lx = s.x - panel.origin.0;
+            let ly = s.y + s.offset_y - panel.origin.1;
+            if lx + self.tile <= 0.0
+                || ly + self.tile <= 0.0
+                || lx >= panel.width as f64
+                || ly >= panel.height as f64
+            {
+                continue;
+            }
+
+            if let Some(r) = &region {
+                r.add(lx.round() as i32, ly.round() as i32, tile as i32, tile as i32);
+            }
+
+            let (col, row) = (s.frame % self.pet.tiles_x, s.frame / self.pet.tiles_x);
             let (sx0, sy0) = (col * tile, row * tile);
-            let ox = s.x.round() as i32 * scale;
-            let oy = (s.y + s.offset_y).round() as i32 * scale;
+            let ox = lx.round() as i32 * scale;
+            let oy = ly.round() as i32 * scale;
             let alpha = s.opacity.clamp(0.0, 1.0);
 
             // Nearest-neighbour upscale by the output scale keeps the pixel art
@@ -357,9 +416,12 @@ impl Overlay {
             }
         }
 
-        self.update_input_region();
-
-        let surface = self.layer.wl_surface();
+        let surface = panel.layer.wl_surface();
+        // Restrict input to the sheep themselves: clicks anywhere else fall
+        // through to the window underneath.
+        if let Some(r) = &region {
+            surface.set_input_region(Some(r.wl_region()));
+        }
         surface.set_buffer_scale(scale);
         surface.damage_buffer(0, 0, bw, bh);
         surface.frame(qh, FrameCallbackData(surface.clone()));
@@ -367,7 +429,11 @@ impl Overlay {
             eprintln!("hyprsheep: buffer attach failed: {e}");
             return;
         }
-        self.layer.commit();
+        panel.layer.commit();
+    }
+
+    fn panel_of(&self, surface: &wl_surface::WlSurface) -> Option<usize> {
+        self.panels.iter().position(|p| p.layer.wl_surface() == surface)
     }
 }
 
@@ -376,10 +442,12 @@ impl CompositorHandler for Overlay {
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _surface: &wl_surface::WlSurface,
+        surface: &wl_surface::WlSurface,
         new_factor: i32,
     ) {
-        self.scale = new_factor.max(1) as u32;
+        if let Some(i) = self.panel_of(surface) {
+            self.panels[i].scale = new_factor.max(1) as u32;
+        }
     }
 
     fn transform_changed(
@@ -395,10 +463,12 @@ impl CompositorHandler for Overlay {
         &mut self,
         _conn: &Connection,
         qh: &QueueHandle<Self>,
-        _surface: &wl_surface::WlSurface,
+        surface: &wl_surface::WlSurface,
         _time: u32,
     ) {
-        self.draw(qh);
+        if let Some(i) = self.panel_of(surface) {
+            self.draw(qh, i);
+        }
     }
 
     fn surface_enter(
@@ -421,36 +491,29 @@ impl CompositorHandler for Overlay {
 }
 
 impl LayerShellHandler for Overlay {
-    fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &LayerSurface) {
-        self.exit = true;
+    fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, layer: &LayerSurface) {
+        self.panels.retain(|p| &p.layer != layer);
+        // Losing every output means there is nowhere left to draw.
+        if self.panels.is_empty() {
+            self.exit = true;
+        }
     }
 
     fn configure(
         &mut self,
         _conn: &Connection,
         qh: &QueueHandle<Self>,
-        _layer: &LayerSurface,
+        layer: &LayerSurface,
         configure: LayerSurfaceConfigure,
         _serial: u32,
     ) {
+        let Some(i) = self.panels.iter().position(|p| &p.layer == layer) else { return };
         let (w, h) = configure.new_size;
         if w != 0 && h != 0 {
-            self.width = w;
-            self.height = h;
+            self.panels[i].width = w;
+            self.panels[i].height = h;
         }
-        // A configure can reset the input region, so re-assert it.
-        self.update_input_region();
-        if !self.configured {
-            self.configured = true;
-            println!(
-                "hyprsheep: overlay {}x{} logical, floor {}, {} windows",
-                self.width,
-                self.height,
-                self.world.area_h,
-                self.world.windows.len()
-            );
-        }
-        self.draw(qh);
+        self.draw(qh, i);
     }
 }
 
@@ -502,7 +565,12 @@ impl PointerHandler for Overlay {
         events: &[PointerEvent],
     ) {
         for event in events {
-            let (x, y) = event.position;
+            // Pointer positions are surface-local; lift them into the global
+            // space the sheep live in.
+            let Some(i) = self.panel_of(&event.surface) else { continue };
+            let origin = self.panels[i].origin;
+            let (x, y) = (event.position.0 + origin.0, event.position.1 + origin.1);
+
             match event.kind {
                 PointerEventKind::Press { button, .. } if button == BTN_LEFT => {
                     self.pressed = self.sheep_at(x, y);
@@ -538,9 +606,30 @@ impl OutputHandler for Overlay {
     fn output_state(&mut self) -> &mut OutputState {
         &mut self.output_state
     }
-    fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
-    fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
-    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
+
+    fn new_output(
+        &mut self,
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+        output: wl_output::WlOutput,
+    ) {
+        self.refresh_world();
+        self.add_panel(qh, output);
+    }
+
+    fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {
+        self.dirty.store(true, Ordering::Relaxed);
+    }
+
+    fn output_destroyed(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        output: wl_output::WlOutput,
+    ) {
+        self.panels.retain(|p| p.output != output);
+        self.dirty.store(true, Ordering::Relaxed);
+    }
 }
 
 impl ShmHandler for Overlay {

@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use crate::engine::{Rect, World};
+use crate::engine::{Rect, Screen, World};
 
 fn socket_dir() -> Result<PathBuf, String> {
     let runtime = std::env::var("XDG_RUNTIME_DIR")
@@ -42,10 +42,12 @@ fn at(v: &Value, key: &str, i: usize) -> f64 {
     v.get(key).and_then(|a| a.get(i)).and_then(Value::as_f64).unwrap_or(0.0)
 }
 
-/// The monitor we render on, in logical pixels.
-#[derive(Clone, Copy, Debug)]
+/// A monitor, in global logical pixels.
+#[derive(Clone, Debug)]
 pub struct Monitor {
     pub id: i64,
+    /// Connector name, e.g. `eDP-1`; how a wl_output is matched to it.
+    pub name: String,
     pub x: f64,
     pub y: f64,
     pub width: f64,
@@ -56,15 +58,20 @@ pub struct Monitor {
 }
 
 impl Monitor {
-    /// Screen height minus any bottom bar; this is the sheep's floor, and
-    /// standing on it is what the pet data calls the taskbar.
-    fn floor(&self) -> f64 {
-        self.height - self.reserved.3
+    fn screen(&self) -> Screen {
+        Screen {
+            id: self.id,
+            x: self.x,
+            y: self.y,
+            w: self.width,
+            h: self.height,
+            reserved: self.reserved,
+        }
     }
 }
 
 /// Read the monitor list, returning the focused one first.
-fn monitors() -> Result<Vec<Monitor>, String> {
+pub fn monitors() -> Result<Vec<Monitor>, String> {
     let v = query("j/monitors")?;
     let list = v.as_array().ok_or("monitors: expected an array")?;
     let mut out: Vec<Monitor> = list
@@ -76,6 +83,7 @@ fn monitors() -> Result<Vec<Monitor>, String> {
             let scale = f(m, "scale").max(0.01);
             Monitor {
                 id: m.get("id").and_then(Value::as_i64).unwrap_or(0),
+                name: m.get("name").and_then(Value::as_str).unwrap_or_default().to_string(),
                 x: f(m, "x"),
                 y: f(m, "y"),
                 width: f(m, "width") / scale,
@@ -107,8 +115,11 @@ fn monitors() -> Result<Vec<Monitor>, String> {
     Ok(out)
 }
 
-/// Build the sheep's world from the current window layout on `monitor`.
-pub fn snapshot(monitor: &Monitor) -> Result<World, String> {
+/// Build the sheep's world: every monitor, and every window visible on one.
+///
+/// Hyprland reports window positions in the same global logical space it lays
+/// monitors out in, so no translation is needed.
+pub fn snapshot(monitors: &[Monitor]) -> Result<World, String> {
     let v = query("j/clients")?;
     let list = v.as_array().ok_or("clients: expected an array")?;
 
@@ -116,12 +127,15 @@ pub fn snapshot(monitor: &Monitor) -> Result<World, String> {
         .iter()
         .filter(|c| {
             // Only windows actually on screen are walkable: mapped, not
-            // hidden, on this monitor, and on the workspace it is showing.
-            c.get("mapped").and_then(Value::as_bool).unwrap_or(false)
-                && !c.get("hidden").and_then(Value::as_bool).unwrap_or(false)
-                && c.get("monitor").and_then(Value::as_i64) == Some(monitor.id)
-                && c.get("workspace").and_then(|w| w.get("id")).and_then(Value::as_i64)
-                    == Some(monitor.active_workspace)
+            // hidden, and on the workspace their monitor is showing.
+            if !c.get("mapped").and_then(Value::as_bool).unwrap_or(false)
+                || c.get("hidden").and_then(Value::as_bool).unwrap_or(false)
+            {
+                return false;
+            }
+            let Some(mid) = c.get("monitor").and_then(Value::as_i64) else { return false };
+            let ws = c.get("workspace").and_then(|w| w.get("id")).and_then(Value::as_i64);
+            monitors.iter().any(|m| m.id == mid && Some(m.active_workspace) == ws)
         })
         .filter_map(|c| {
             let w = at(c, "size", 0);
@@ -136,13 +150,7 @@ pub fn snapshot(monitor: &Monitor) -> Result<World, String> {
                 .and_then(Value::as_str)
                 .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
                 .unwrap_or(0);
-            Some(Rect {
-                id,
-                x: at(c, "at", 0) - monitor.x,
-                y: at(c, "at", 1) - monitor.y,
-                w,
-                h,
-            })
+            Some(Rect { id, x: at(c, "at", 0), y: at(c, "at", 1), w, h })
         })
         .collect();
 
@@ -150,28 +158,14 @@ pub fn snapshot(monitor: &Monitor) -> Result<World, String> {
     // topmost edge rather than one buried behind it.
     windows.sort_by(|a, b| a.y.total_cmp(&b.y));
 
-    Ok(World {
-        screen_w: monitor.width,
-        screen_h: monitor.height,
-        area_w: monitor.width - monitor.reserved.0 - monitor.reserved.2,
-        area_h: monitor.floor(),
-        windows,
-    })
+    Ok(World { screens: monitors.iter().map(Monitor::screen).collect(), windows })
 }
 
-/// The monitor the overlay should live on, plus its initial world.
-pub fn current() -> Result<(Monitor, World), String> {
-    let m = *monitors()?.first().ok_or("no monitors")?;
+/// The current monitor layout and the world it implies.
+pub fn world() -> Result<(Vec<Monitor>, World), String> {
+    let m = monitors()?;
     let w = snapshot(&m)?;
     Ok((m, w))
-}
-
-/// Re-read the monitor by id, to pick up bar or workspace changes.
-pub fn refresh_monitor(id: i64) -> Result<Monitor, String> {
-    monitors()?
-        .into_iter()
-        .find(|m| m.id == id)
-        .ok_or_else(|| format!("monitor {id} went away"))
 }
 
 /// Watch the event socket, raising `dirty` whenever the layout may have moved.

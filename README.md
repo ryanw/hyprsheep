@@ -8,9 +8,9 @@ and occasionally stops for a nap.
 
 ## Status
 
-Working: the overlay, the animation engine, window collision against live
-Hyprland geometry, and picking the sheep up with the mouse. Not yet wired up:
-multi-monitor support.
+Everything works: the overlay, the animation engine, window collision against
+live Hyprland geometry, picking the sheep up with the mouse, and multiple
+monitors.
 
 ## Running
 
@@ -41,8 +41,14 @@ Window geometry comes from Hyprland's IPC. `.socket.sock` answers `j/clients`
 and `j/monitors`; `.socket2.sock` streams an event per compositor change,
 which is used only as a hint to re-read the layout.
 
-The sheep is drawn on a `wlr-layer-shell` overlay surface anchored to all four
-edges, with a negative exclusive zone so bars cannot displace it. Its input
+The sheep live in one global coordinate space spanning every monitor, so a
+sheep can walk off one screen and onto the next. Each output gets its own
+`wlr-layer-shell` overlay surface, drawing whichever sheep overlap it; one
+straddling the seam is drawn on both. Screen edges are only walls where no
+other monitor continues past them, and each monitor keeps its own floor, so a
+sheep that walks off a short screen onto a taller one falls.
+
+Each surface is anchored to all four with a negative exclusive zone so bars cannot displace it. Its input
 region is narrowed to just the sheep, so they can be picked up and dragged
 while every other click falls straight through to the window underneath.
 
