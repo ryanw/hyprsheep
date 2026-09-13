@@ -1,6 +1,8 @@
-//! Fullscreen, click-through wlr-layer-shell overlay that the sheep is drawn on.
+//! Fullscreen, click-through wlr-layer-shell overlay that the sheep live on.
 
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState, FrameCallbackData, Region},
@@ -23,10 +25,24 @@ use wayland_client::{
     Connection, QueueHandle,
 };
 
-use crate::sprites::{Frame, Sheet, TILE};
+use crate::anim::Pet;
+use crate::engine::{Event, Sheep, World};
+use crate::hypr;
+use crate::sprites::Sheet;
 
-/// The original runs its animations at roughly ten frames a second.
-const FRAME_MS: u128 = 100;
+/// How often to re-read the window layout even without an event, so that
+/// interactive drags and resizes are followed smoothly.
+const REFRESH: Duration = Duration::from_millis(200);
+/// Guard against a burst of catch-up steps after the compositor stalls us.
+const MAX_STEPS_PER_FRAME: usize = 8;
+
+struct Pen {
+    sheep: Sheep,
+    next_step: Instant,
+    /// Last (animation, step) reported by the trace, so that re-entering the
+    /// same animation still logs.
+    traced: (u32, u32),
+}
 
 pub struct Overlay {
     registry_state: RegistryState,
@@ -39,22 +55,29 @@ pub struct Overlay {
     /// Logical size of the overlay, as configured by the compositor.
     width: u32,
     height: u32,
-    /// Output scale factor; the shm buffer is this many times larger.
+    /// Output scale; the shm buffer is this many times larger.
     scale: u32,
     configured: bool,
     pub exit: bool,
 
     sheet: Sheet,
-    /// Placeholder walk cycle until the real animation set is wired up.
-    cycle: Vec<Frame>,
-    step: usize,
-    last_step: Instant,
-    /// Sheep position in logical pixels, top-left of the sprite.
-    x: f32,
-    y: f32,
+    pet: Pet,
+    tile: f64,
+    flock: Vec<Pen>,
+
+    monitor: hypr::Monitor,
+    world: World,
+    dirty: Arc<AtomicBool>,
+    last_refresh: Instant,
+    /// Log every animation change; set HYPRSHEEP_TRACE=1.
+    trace: bool,
 }
 
-pub fn run(sheet: Sheet) -> Result<(), String> {
+pub fn run(sheet: Sheet, pet: Pet) -> Result<(), String> {
+    let (monitor, world) = hypr::current()?;
+    let dirty = Arc::new(AtomicBool::new(false));
+    hypr::watch(dirty.clone());
+
     let conn = Connection::connect_to_env().map_err(|e| format!("wayland connect: {e}"))?;
     let (globals, mut queue) =
         registry_queue_init(&conn).map_err(|e| format!("registry init: {e}"))?;
@@ -87,10 +110,7 @@ pub fn run(sheet: Sheet) -> Result<(), String> {
     layer.commit();
 
     let pool = SlotPool::new(256 * 256 * 4, &shm).map_err(|e| format!("shm pool: {e}"))?;
-
-    // Placeholder: the first few tiles of the top row read as a walk cycle.
-    // Phase 2 replaces this with the parsed animation set.
-    let cycle = (0..4).map(|c| Frame::cell(c, 0)).collect();
+    let tile = (sheet.width / pet.tiles_x.max(1)) as f64;
 
     let mut overlay = Overlay {
         registry_state: RegistryState::new(&globals),
@@ -105,12 +125,17 @@ pub fn run(sheet: Sheet) -> Result<(), String> {
         configured: false,
         exit: false,
         sheet,
-        cycle,
-        step: 0,
-        last_step: Instant::now(),
-        x: 40.0,
-        y: 40.0,
+        pet,
+        tile,
+        flock: Vec::new(),
+        monitor,
+        world,
+        dirty,
+        last_refresh: Instant::now(),
+        trace: std::env::var_os("HYPRSHEEP_TRACE").is_some(),
     };
+
+    overlay.add_sheep(false, None);
 
     loop {
         queue.blocking_dispatch(&mut overlay).map_err(|e| format!("dispatch: {e}"))?;
@@ -121,21 +146,106 @@ pub fn run(sheet: Sheet) -> Result<(), String> {
 }
 
 impl Overlay {
-    /// Advance the placeholder walk. Real behaviour arrives with the state machine.
-    fn tick(&mut self) {
-        if self.last_step.elapsed().as_millis() < FRAME_MS {
+    fn add_sheep(&mut self, is_child: bool, start: Option<(u32, f64, f64)>) {
+        let mut sheep = Sheep::new(is_child);
+        let mut events = Vec::new();
+        match start {
+            Some((animation, x, y)) => {
+                sheep.x = x;
+                sheep.y = y;
+                sheep.begin(&self.pet, &self.world, self.tile, animation, &mut events);
+            }
+            None => sheep.spawn(&self.pet, &self.world, self.tile, &mut events),
+        }
+        self.flock.push(Pen { sheep, next_step: Instant::now(), traced: (u32::MAX, 0) });
+        self.handle(events);
+    }
+
+    fn handle(&mut self, events: Vec<Event>) {
+        for e in events {
+            if let Event::SpawnChild { animation, x, y } = e {
+                // A companion is a fully independent sheep that dies rather
+                // than respawning when its chain ends.
+                self.add_sheep(true, Some((animation, x, y)));
+            }
+        }
+    }
+
+    /// Re-read the window layout when an event says it may have changed, or
+    /// periodically to follow an in-progress drag.
+    fn refresh_world(&mut self) {
+        let due = self.dirty.swap(false, Ordering::Relaxed)
+            || self.last_refresh.elapsed() >= REFRESH;
+        if !due {
             return;
         }
-        self.last_step = Instant::now();
-        self.step = (self.step + 1) % self.cycle.len();
+        self.last_refresh = Instant::now();
 
-        self.x += 4.0;
-        if self.x > self.width as f32 {
-            self.x = -(TILE as f32);
+        if let Ok(m) = hypr::refresh_monitor(self.monitor.id) {
+            self.monitor = m;
         }
-        // Sit on the bottom edge so there is something obviously "ground"-like
-        // to look at before real window collision exists.
-        self.y = self.height.saturating_sub(TILE) as f32;
+        match hypr::snapshot(&self.monitor) {
+            Ok(w) => self.world = w,
+            Err(e) => eprintln!("hyprsheep: window query failed: {e}"),
+        }
+    }
+
+    fn tick(&mut self) {
+        self.refresh_world();
+
+        let now = Instant::now();
+        let mut events = Vec::new();
+        let mut dead = Vec::new();
+
+        for (i, pen) in self.flock.iter_mut().enumerate() {
+            let mut steps = 0;
+            while now >= pen.next_step && steps < MAX_STEPS_PER_FRAME {
+                let delay = pen.sheep.step(&self.pet, &self.world, self.tile, &mut events);
+                pen.next_step += delay;
+                steps += 1;
+            }
+            // If we fell far behind, resynchronise rather than sprinting.
+            if steps == MAX_STEPS_PER_FRAME && now > pen.next_step {
+                pen.next_step = now;
+            }
+            let restarted = pen.sheep.animation != pen.traced.0 || pen.sheep.step < pen.traced.1;
+            if self.trace && restarted {
+                pen.traced = (pen.sheep.animation, pen.sheep.step);
+                let name = self
+                    .pet
+                    .get(pen.sheep.animation)
+                    .map(|a| a.name.as_str())
+                    .unwrap_or("?");
+                println!(
+                    "{:>3} {:<18} at ({:>5.0},{:>5.0}) {}{}",
+                    pen.sheep.animation,
+                    name,
+                    pen.sheep.x,
+                    pen.sheep.y,
+                    if pen.sheep.flipped { "flipped " } else { "" },
+                    match pen.sheep.resting_on() {
+                        Some(id) => format!("on window {id:#x}"),
+                        None => "airborne".to_string(),
+                    }
+                );
+            } else if self.trace {
+                pen.traced.1 = pen.sheep.step;
+            }
+            if events.contains(&Event::Died) {
+                dead.push(i);
+            }
+            events.retain(|e| *e != Event::Died);
+        }
+
+        for i in dead.into_iter().rev() {
+            self.flock.remove(i);
+        }
+        self.handle(events);
+
+        // The flock should never empty out; a lone sheep respawns itself.
+        if self.flock.is_empty() {
+            self.add_sheep(false, None);
+        }
     }
 
     fn draw(&mut self, qh: &QueueHandle<Self>) {
@@ -144,59 +254,72 @@ impl Overlay {
         }
         self.tick();
 
-        let scale = self.scale;
-        let bw = (self.width * scale) as i32;
-        let bh = (self.height * scale) as i32;
+        let scale = self.scale as i32;
+        let bw = self.width as i32 * scale;
+        let bh = self.height as i32 * scale;
         let stride = bw * 4;
 
-        let (buffer, canvas) = match self.pool.create_buffer(bw, bh, stride, wl_shm::Format::Argb8888)
-        {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("hyprsheep: buffer alloc failed: {e}");
-                return;
-            }
-        };
+        let (buffer, canvas) =
+            match self.pool.create_buffer(bw, bh, stride, wl_shm::Format::Argb8888) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("hyprsheep: buffer alloc failed: {e}");
+                    return;
+                }
+            };
 
         // Fully transparent everywhere except the sheep.
         canvas.fill(0);
 
-        let frame = self.cycle[self.step];
-        let ox = (self.x.round() as i32) * scale as i32;
-        let oy = (self.y.round() as i32) * scale as i32;
+        let tile = self.tile as u32;
+        for pen in &self.flock {
+            let s = &pen.sheep;
+            let frame = s.frame;
+            let (col, row) = (frame % self.pet.tiles_x, frame / self.pet.tiles_x);
+            let (sx0, sy0) = (col * tile, row * tile);
+            let ox = s.x.round() as i32 * scale;
+            let oy = (s.y + s.offset_y).round() as i32 * scale;
+            let alpha = s.opacity.clamp(0.0, 1.0);
 
-        // Nearest-neighbour upscale by the output scale keeps the pixel art
-        // crisp on HiDPI rather than letting the compositor blur it.
-        for sy in 0..TILE {
-            for sx in 0..TILE {
-                let [r, g, b, a] = self.sheet.pixel(frame.x + sx, frame.y + sy);
-                if a == 0 {
-                    continue;
-                }
-                // wl_shm ARGB8888 expects premultiplied alpha.
-                let pm = |c: u8| ((c as u32 * a as u32) / 255) as u8;
-                let argb =
-                    u32::from_le_bytes([pm(b), pm(g), pm(r), a]).to_le_bytes();
-
-                for dy in 0..scale as i32 {
-                    let py = oy + sy as i32 * scale as i32 + dy;
-                    if py < 0 || py >= bh {
+            // Nearest-neighbour upscale by the output scale keeps the pixel art
+            // crisp on HiDPI rather than letting the compositor blur it.
+            for sy in 0..tile {
+                for sx in 0..tile {
+                    // Flipping mirrors the sprite horizontally; the engine
+                    // mirrors its velocity to match.
+                    let src_x = if s.flipped { tile - 1 - sx } else { sx };
+                    let [r, g, b, a] = self.sheet.pixel(sx0 + src_x, sy0 + sy);
+                    if a == 0 {
                         continue;
                     }
-                    for dx in 0..scale as i32 {
-                        let px = ox + sx as i32 * scale as i32 + dx;
-                        if px < 0 || px >= bw {
+                    let a = (a as f64 * alpha) as u32;
+                    if a == 0 {
+                        continue;
+                    }
+                    // wl_shm ARGB8888 expects premultiplied alpha.
+                    let pm = |c: u8| ((c as u32 * a) / 255) as u8;
+                    let argb = u32::from_le_bytes([pm(b), pm(g), pm(r), a as u8]).to_le_bytes();
+
+                    for dy in 0..scale {
+                        let py = oy + sy as i32 * scale + dy;
+                        if py < 0 || py >= bh {
                             continue;
                         }
-                        let i = ((py * bw + px) * 4) as usize;
-                        canvas[i..i + 4].copy_from_slice(&argb);
+                        for dx in 0..scale {
+                            let px = ox + sx as i32 * scale + dx;
+                            if px < 0 || px >= bw {
+                                continue;
+                            }
+                            let i = ((py * bw + px) * 4) as usize;
+                            canvas[i..i + 4].copy_from_slice(&argb);
+                        }
                     }
                 }
             }
         }
 
         let surface = self.layer.wl_surface();
-        surface.set_buffer_scale(scale as i32);
+        surface.set_buffer_scale(scale);
         surface.damage_buffer(0, 0, bw, bh);
         surface.frame(qh, FrameCallbackData(surface.clone()));
         if let Err(e) = buffer.attach_to(surface) {
@@ -280,7 +403,13 @@ impl LayerShellHandler for Overlay {
         }
         if !self.configured {
             self.configured = true;
-            println!("hyprsheep: overlay {}x{} logical", self.width, self.height);
+            println!(
+                "hyprsheep: overlay {}x{} logical, floor {}, {} windows",
+                self.width,
+                self.height,
+                self.world.area_h,
+                self.world.windows.len()
+            );
         }
         self.draw(qh);
     }

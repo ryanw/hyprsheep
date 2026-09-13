@@ -1,10 +1,7 @@
 //! Sprite sheet loading and frame extraction.
 //!
-//! The classic eSheep sheet is a grid of fixed-size tiles. Frames are addressed
-//! by pixel offset into the sheet, matching the convention the original
-//! `animations.xml` uses.
-
-pub const TILE: u32 = 40;
+//! The sheet is a grid of fixed-size tiles. How it is divided up is declared by
+//! the pet file rather than assumed here, so this module only decodes pixels.
 
 pub struct Sheet {
     pub width: u32,
@@ -38,14 +35,6 @@ impl Sheet {
         Ok(Sheet { width: info.width, height: info.height, pixels })
     }
 
-    pub fn cols(&self) -> u32 {
-        self.width / TILE
-    }
-
-    pub fn rows(&self) -> u32 {
-        self.height / TILE
-    }
-
     /// Straight-alpha RGBA for one pixel of the sheet.
     #[inline]
     pub fn pixel(&self, x: u32, y: u32) -> [u8; 4] {
@@ -54,29 +43,5 @@ impl Sheet {
         }
         let i = ((y * self.width + x) * 4) as usize;
         [self.pixels[i], self.pixels[i + 1], self.pixels[i + 2], self.pixels[i + 3]]
-    }
-}
-
-/// A single animation frame: a TILE-sized window into the sheet, addressed by
-/// its top-left pixel offset.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Frame {
-    pub x: u32,
-    pub y: u32,
-}
-
-impl Frame {
-    pub const fn at(x: u32, y: u32) -> Self {
-        Frame { x, y }
-    }
-
-    /// Convenience for addressing by grid cell rather than pixel offset.
-    pub const fn cell(col: u32, row: u32) -> Self {
-        Frame { x: col * TILE, y: row * TILE }
-    }
-
-    /// The original addresses frames as linear, row-major tile indices.
-    pub const fn index(i: u32, cols: u32) -> Self {
-        Frame { x: (i % cols) * TILE, y: (i / cols) * TILE }
     }
 }

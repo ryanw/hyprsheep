@@ -139,6 +139,17 @@ impl Sheep {
         }
     }
 
+    /// The window the sheep is standing on, if any.
+    pub fn resting_on(&self) -> Option<u64> {
+        self.resting_on
+    }
+
+    /// Start `id` directly, rather than via the spawn table. Used for
+    /// companion sheep, whose animation and position the parent dictates.
+    pub fn begin(&mut self, pet: &Pet, world: &World, tile: f64, id: u32, events: &mut Vec<Event>) {
+        self.enter(pet, world, tile, id, events);
+    }
+
     /// Place the sheep at a weighted-random spawn point and start its animation.
     pub fn spawn(&mut self, pet: &Pet, world: &World, tile: f64, events: &mut Vec<Event>) {
         let Some(spawn) = pet.choose_spawn() else { return };
@@ -301,8 +312,15 @@ impl Sheep {
         } else if y2 > 0.0 {
             // Descending: look for a window top to land on.
             if let Some(r) = self.surface_under(world, tile, false) {
-                if self.y > tile {
-                    self.y = r.top().ceil() - tile;
+                // The reference refuses to land while the sheep is within one
+                // tile of the top of the screen, to avoid latching onto page
+                // elements at the very top. Under a tiling compositor every
+                // top-row window sits just below the bar, so that test would
+                // make all of them unlandable; require instead that the sheep
+                // ends up on screen.
+                let landing = r.top().ceil() - tile;
+                if landing >= 0.0 {
+                    self.y = landing;
                     self.resting_on = Some(r.id);
                     hit_border = true;
                 }
@@ -423,7 +441,7 @@ mod tests {
         s.x = 400.0;
         s.y = 100.0;
         // Start walking in mid-air; gravity must take over.
-        s.enter(&p, &w, TILE, 1, &mut ev);
+        s.begin(&p, &w, TILE, 1, &mut ev);
         let mut landed = false;
         for _ in 0..400 {
             s.step(&p, &w, TILE, &mut ev);
@@ -437,6 +455,30 @@ mod tests {
         assert!((s.y + TILE - 600.0).abs() < 1.0, "feet at {}", s.y + TILE);
     }
 
+    /// Under a bar, tiled windows sit only a few pixels down. The sheep must
+    /// still be able to land on them.
+    #[test]
+    fn lands_on_a_window_just_below_a_bar() {
+        let p = pet();
+        let mut w = world();
+        w.windows.push(Rect { id: 3, x: 12.0, y: 42.0, w: 941.0, h: 1026.0 });
+
+        let mut s = Sheep::new(false);
+        let mut ev = Vec::new();
+        s.x = 500.0;
+        s.y = -60.0;
+        s.begin(&p, &w, TILE, 5, &mut ev);
+        for _ in 0..400 {
+            s.step(&p, &w, TILE, &mut ev);
+            if s.resting_on == Some(3) {
+                assert!((s.y + TILE - 42.0).abs() < 1.0, "feet at {}", s.y + TILE);
+                assert!(s.y >= 0.0, "sheep landed off the top of the screen");
+                return;
+            }
+        }
+        panic!("sheep fell past a window at y=42 (ended at y={})", s.y);
+    }
+
     #[test]
     fn a_closed_window_drops_the_sheep() {
         let p = pet();
@@ -447,7 +489,7 @@ mod tests {
         s.x = 400.0;
         s.y = 560.0;
         s.resting_on = Some(7);
-        s.enter(&p, &w, TILE, 1, &mut ev);
+        s.begin(&p, &w, TILE, 1, &mut ev);
 
         w.windows.clear();
         for _ in 0..200 {
@@ -488,7 +530,7 @@ mod tests {
         let mut s = Sheep::new(false);
         let mut ev = Vec::new();
         // Animation 26 (eat) declares a companion flower.
-        s.enter(&p, &w, TILE, 26, &mut ev);
+        s.begin(&p, &w, TILE, 26, &mut ev);
         assert!(
             matches!(ev.first(), Some(Event::SpawnChild { animation: 27, .. })),
             "eat should spawn the flower, got {ev:?}"
@@ -497,7 +539,7 @@ mod tests {
         // The flower is terminal, so a child running it must report Died.
         let mut child = Sheep::new(true);
         ev.clear();
-        child.enter(&p, &w, TILE, 27, &mut ev);
+        child.begin(&p, &w, TILE, 27, &mut ev);
         for _ in 0..5000 {
             child.step(&p, &w, TILE, &mut ev);
             if ev.contains(&Event::Died) {
