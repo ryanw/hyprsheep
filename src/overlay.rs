@@ -10,6 +10,10 @@ use smithay_client_toolkit::{
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
+    seat::{
+        pointer::{PointerEvent, PointerEventKind, PointerHandler},
+        Capability, SeatHandler, SeatState,
+    },
     shell::{
         wlr_layer::{
             Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
@@ -21,7 +25,7 @@ use smithay_client_toolkit::{
 };
 use wayland_client::{
     globals::registry_queue_init,
-    protocol::{wl_output, wl_shm, wl_surface},
+    protocol::{wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
     Connection, QueueHandle,
 };
 
@@ -33,6 +37,8 @@ use crate::sprites::Sheet;
 /// How often to re-read the window layout even without an event, so that
 /// interactive drags and resizes are followed smoothly.
 const REFRESH: Duration = Duration::from_millis(200);
+/// Linux input code for the left mouse button.
+const BTN_LEFT: u32 = 0x110;
 /// Guard against a burst of catch-up steps after the compositor stalls us.
 const MAX_STEPS_PER_FRAME: usize = 8;
 
@@ -47,6 +53,10 @@ struct Pen {
 pub struct Overlay {
     registry_state: RegistryState,
     output_state: OutputState,
+    seat_state: SeatState,
+    pointer: Option<wl_pointer::WlPointer>,
+    /// Index of the sheep the pointer is pressed on, if any.
+    pressed: Option<usize>,
     shm: Shm,
     pool: SlotPool,
     layer: LayerSurface,
@@ -101,9 +111,8 @@ pub fn run(sheet: Sheet, pet: Pet) -> Result<(), String> {
     layer.set_exclusive_zone(-1);
     layer.set_keyboard_interactivity(KeyboardInteractivity::None);
 
-    // An empty input region makes every click fall through to whatever is
-    // underneath. Grabbing the sheep with the mouse comes later and will need
-    // this region narrowed to the sprite instead of emptied.
+    // Start fully click-through; once there are sheep on screen the region is
+    // narrowed to just their sprites so everything else still falls through.
     let empty = Region::new(&compositor).map_err(|e| format!("wl_region: {e}"))?;
     layer.wl_surface().set_input_region(Some(empty.wl_region()));
 
@@ -115,6 +124,9 @@ pub fn run(sheet: Sheet, pet: Pet) -> Result<(), String> {
     let mut overlay = Overlay {
         registry_state: RegistryState::new(&globals),
         output_state: OutputState::new(&globals, &qh),
+        seat_state: SeatState::new(&globals, &qh),
+        pointer: None,
+        pressed: None,
         shm,
         pool,
         layer,
@@ -248,6 +260,33 @@ impl Overlay {
         }
     }
 
+    /// Restrict input to the sheep themselves: clicks anywhere else fall
+    /// through to the window underneath, but the sheep can be picked up.
+    fn update_input_region(&mut self) {
+        let Ok(region) = Region::new(&self.compositor) else { return };
+        let tile = self.tile as i32;
+        for pen in &self.flock {
+            region.add(
+                pen.sheep.x.round() as i32,
+                (pen.sheep.y + pen.sheep.offset_y).round() as i32,
+                tile,
+                tile,
+            );
+        }
+        self.layer.wl_surface().set_input_region(Some(region.wl_region()));
+    }
+
+    /// The topmost sheep whose sprite covers a surface-local point.
+    fn sheep_at(&self, x: f64, y: f64) -> Option<usize> {
+        self.flock.iter().rposition(|pen| {
+            let top = pen.sheep.y + pen.sheep.offset_y;
+            x >= pen.sheep.x
+                && x < pen.sheep.x + self.tile
+                && y >= top
+                && y < top + self.tile
+        })
+    }
+
     fn draw(&mut self, qh: &QueueHandle<Self>) {
         if self.width == 0 || self.height == 0 {
             return;
@@ -317,6 +356,8 @@ impl Overlay {
                 }
             }
         }
+
+        self.update_input_region();
 
         let surface = self.layer.wl_surface();
         surface.set_buffer_scale(scale);
@@ -397,10 +438,8 @@ impl LayerShellHandler for Overlay {
             self.width = w;
             self.height = h;
         }
-        // Re-assert the empty input region; a configure can reset it.
-        if let Ok(empty) = Region::new(&self.compositor) {
-            self.layer.wl_surface().set_input_region(Some(empty.wl_region()));
-        }
+        // A configure can reset the input region, so re-assert it.
+        self.update_input_region();
         if !self.configured {
             self.configured = true;
             println!(
@@ -412,6 +451,86 @@ impl LayerShellHandler for Overlay {
             );
         }
         self.draw(qh);
+    }
+}
+
+impl SeatHandler for Overlay {
+    fn seat_state(&mut self) -> &mut SeatState {
+        &mut self.seat_state
+    }
+
+    fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
+
+    fn new_capability(
+        &mut self,
+        _conn: &Connection,
+        qh: &QueueHandle<Self>,
+        seat: wl_seat::WlSeat,
+        capability: Capability,
+    ) {
+        if capability == Capability::Pointer && self.pointer.is_none() {
+            match self.seat_state.get_pointer(qh, &seat) {
+                Ok(p) => self.pointer = Some(p),
+                Err(e) => eprintln!("hyprsheep: no pointer: {e}"),
+            }
+        }
+    }
+
+    fn remove_capability(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: wl_seat::WlSeat,
+        capability: Capability,
+    ) {
+        if capability == Capability::Pointer {
+            if let Some(p) = self.pointer.take() {
+                p.release();
+            }
+        }
+    }
+
+    fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
+}
+
+impl PointerHandler for Overlay {
+    fn pointer_frame(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _pointer: &wl_pointer::WlPointer,
+        events: &[PointerEvent],
+    ) {
+        for event in events {
+            let (x, y) = event.position;
+            match event.kind {
+                PointerEventKind::Press { button, .. } if button == BTN_LEFT => {
+                    self.pressed = self.sheep_at(x, y);
+                }
+                PointerEventKind::Motion { .. } => {
+                    // As in the original, a click alone does not pick the sheep
+                    // up; it takes a press followed by movement.
+                    if let Some(i) = self.pressed {
+                        if let Some(pen) = self.flock.get_mut(i) {
+                            if !pen.sheep.dragging {
+                                pen.sheep.grab(&self.pet, &self.world, self.tile);
+                                pen.next_step = Instant::now();
+                            }
+                            pen.sheep.drag_to(x, y, self.tile);
+                        }
+                    }
+                }
+                PointerEventKind::Release { button, .. } if button == BTN_LEFT => {
+                    if let Some(pen) = self.pressed.take().and_then(|i| self.flock.get_mut(i)) {
+                        if pen.sheep.dragging {
+                            pen.sheep.release();
+                        }
+                    }
+                }
+                PointerEventKind::Leave { .. } => self.pressed = None,
+                _ => {}
+            }
+        }
     }
 }
 
@@ -436,7 +555,7 @@ impl ProvidesRegistryState for Overlay {
     fn registry(&mut self) -> &mut RegistryState {
         &mut self.registry_state
     }
-    registry_handlers![OutputState];
+    registry_handlers![OutputState, SeatState];
 }
 
 smithay_client_toolkit::delegate_dispatch2!(Overlay);

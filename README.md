@@ -8,8 +8,8 @@ and occasionally stops for a nap.
 
 ## Status
 
-Working: the overlay, the animation engine, and window collision against live
-Hyprland geometry. Not yet wired up: grabbing the sheep with the mouse, and
+Working: the overlay, the animation engine, window collision against live
+Hyprland geometry, and picking the sheep up with the mouse. Not yet wired up:
 multi-monitor support.
 
 ## Running
@@ -42,8 +42,9 @@ and `j/monitors`; `.socket2.sock` streams an event per compositor change,
 which is used only as a hint to re-read the layout.
 
 The sheep is drawn on a `wlr-layer-shell` overlay surface anchored to all four
-edges, with a negative exclusive zone so bars cannot displace it and an empty
-input region so every click falls through to the window underneath.
+edges, with a negative exclusive zone so bars cannot displace it. Its input
+region is narrowed to just the sheep, so they can be picked up and dragged
+while every other click falls straight through to the window underneath.
 
 ## Divergences from the reference
 
