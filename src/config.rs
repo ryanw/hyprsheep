@@ -36,11 +36,19 @@ pub struct Config {
     /// An alternative pet file in the same XML format. The sprite sheet is
     /// taken from the file itself.
     pub pet: Option<PathBuf>,
+    /// Log every animation change and where the sheep is.
+    pub trace: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Config { sheep: 1, monitors: Monitors::All, draggable: true, pet: None }
+        Config {
+            sheep: 1,
+            monitors: Monitors::All,
+            draggable: true,
+            pet: None,
+            trace: false,
+        }
     }
 }
 
@@ -55,6 +63,13 @@ pub fn path() -> Option<PathBuf> {
 
 impl Config {
     pub fn load() -> Config {
+        let mut cfg = Config::load_file();
+        // The environment variable is a convenience equivalent to --trace.
+        cfg.trace |= std::env::var_os("HYPRSHEEP_TRACE").is_some();
+        cfg
+    }
+
+    fn load_file() -> Config {
         let Some(p) = path() else { return Config::default() };
         match std::fs::read_to_string(&p) {
             Ok(text) => Config::parse(&text, &p),
@@ -102,10 +117,77 @@ impl Config {
                 ("monitors", Value::List(l)) => cfg.monitors = Monitors::Only(l.clone()),
                 ("monitors", Value::Str(s)) => cfg.monitors = Monitors::Only(vec![s.clone()]),
                 ("pet", Value::Str(s)) => cfg.pet = Some(expand_tilde(s, home.as_deref())),
+                ("trace", Value::Bool(b)) => cfg.trace = *b,
                 _ => eprintln!("hyprsheep: {}: ignoring `{key}`", from.display()),
             }
         }
         cfg
+    }
+}
+
+/// Every setting can also be given on the command line, where it overrides
+/// whatever the file said.
+impl Config {
+    pub fn apply_args<I: IntoIterator<Item = String>>(&mut self, args: I) -> Result<(), String> {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let mut args = args.into_iter().peekable();
+
+        while let Some(arg) = args.next() {
+            // Both `--key value` and `--key=value` are accepted.
+            let (key, inline) = match arg.split_once('=') {
+                Some((k, v)) => (k.to_string(), Some(v.to_string())),
+                None => (arg.clone(), None),
+            };
+            let mut value = || match inline.clone() {
+                Some(v) => Ok(v),
+                None => args.next().ok_or(format!("{key} needs a value")),
+            };
+
+            match key.as_str() {
+                "--sheep" => {
+                    let v = value()?;
+                    self.sheep = v
+                        .parse()
+                        .ok()
+                        .filter(|n| *n >= 1)
+                        .ok_or(format!("--sheep wants a number of 1 or more, not {v:?}"))?;
+                }
+                "--monitors" => {
+                    let v = value()?;
+                    self.monitors = if v == "all" {
+                        Monitors::All
+                    } else {
+                        let names: Vec<String> = v
+                            .split(',')
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string)
+                            .collect();
+                        if names.is_empty() {
+                            return Err("--monitors wants \"all\" or a list of names".into());
+                        }
+                        Monitors::Only(names)
+                    };
+                }
+                "--pet" => self.pet = Some(expand_tilde(&value()?, home.as_deref())),
+                "--draggable" => self.draggable = flag(inline.as_deref(), &key)?,
+                "--no-draggable" => self.draggable = false,
+                "--trace" => self.trace = flag(inline.as_deref(), &key)?,
+                "--no-trace" => self.trace = false,
+                other => return Err(format!("unknown option `{other}`")),
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A boolean flag: bare means on, or an explicit `=true`/`=false`.
+fn flag(inline: Option<&str>, key: &str) -> Result<bool, String> {
+    match inline {
+        None => Ok(true),
+        Some("true") => Ok(true),
+        Some("false") => Ok(false),
+        Some(v) => Err(format!("{key} wants true or false, not {v:?}")),
     }
 }
 
@@ -231,6 +313,71 @@ mod tests {
         // Nonsense lines, unknown keys and wrong types all keep the default.
         let c = parse("nonsense\nsheep = lots\nunknown = 1\nsheep = 0\n");
         assert_eq!(c, Config::default());
+    }
+
+    fn args(list: &[&str]) -> Result<Config, String> {
+        let mut c = Config::default();
+        c.apply_args(list.iter().map(|s| s.to_string()))?;
+        Ok(c)
+    }
+
+    #[test]
+    fn every_setting_has_a_command_line_form() {
+        let c = args(&["--sheep", "4", "--monitors", "eDP-1,HDMI-A-1", "--no-draggable"]).unwrap();
+        assert_eq!(c.sheep, 4);
+        assert_eq!(c.monitors, Monitors::Only(vec!["eDP-1".into(), "HDMI-A-1".into()]));
+        assert!(!c.draggable);
+
+        // Everything the file understands is also an option.
+        assert_eq!(args(&["--monitors", "all"]).unwrap().monitors, Monitors::All);
+        assert_eq!(args(&["--pet", "/tmp/g.xml"]).unwrap().pet, Some(PathBuf::from("/tmp/g.xml")));
+        assert!(args(&["--trace"]).unwrap().trace);
+    }
+
+    #[test]
+    fn both_spellings_work() {
+        assert_eq!(args(&["--sheep=7"]).unwrap().sheep, 7);
+        assert_eq!(args(&["--sheep", "7"]).unwrap().sheep, 7);
+        assert_eq!(args(&["--pet=/a/b.xml"]).unwrap().pet, Some(PathBuf::from("/a/b.xml")));
+        // Booleans are bare, negated, or explicit.
+        assert!(args(&["--draggable"]).unwrap().draggable);
+        assert!(!args(&["--no-draggable"]).unwrap().draggable);
+        assert!(!args(&["--draggable=false"]).unwrap().draggable);
+        assert!(args(&["--draggable=true"]).unwrap().draggable);
+    }
+
+    #[test]
+    fn the_command_line_wins_over_the_file() {
+        let mut c = parse("sheep = 2\ndraggable = true\nmonitors = [\"eDP-1\"]\n");
+        c.apply_args(["--sheep=9", "--no-draggable"].iter().map(|s| s.to_string())).unwrap();
+        assert_eq!(c.sheep, 9);
+        assert!(!c.draggable);
+        // Settings not given on the command line keep the file's value.
+        assert_eq!(c.monitors, Monitors::Only(vec!["eDP-1".into()]));
+    }
+
+    #[test]
+    fn bad_options_are_rejected_with_a_reason() {
+        // Unlike the config file, a bad option is worth stopping for: the user
+        // is standing right there and can fix it.
+        for bad in [
+            vec!["--nonsense"],
+            vec!["--sheep"],
+            vec!["--sheep", "lots"],
+            vec!["--sheep", "0"],
+            vec!["--draggable=maybe"],
+            vec!["--monitors", ""],
+            vec!["--pet"],
+        ] {
+            assert!(args(&bad).is_err(), "{bad:?} should have been rejected");
+        }
+    }
+
+    #[test]
+    fn trace_can_be_set_either_way() {
+        assert!(!Config::default().trace);
+        assert!(parse("trace = true").trace);
+        assert!(!args(&["--trace", "--no-trace"]).unwrap().trace);
     }
 
     #[test]

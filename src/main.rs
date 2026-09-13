@@ -22,33 +22,38 @@ hyprsheep - a desktop sheep for Hyprland
 
 usage: hyprsheep [options]
 
-options:
-  -h, --help     show this message
-  -V, --version  show the version
-  --trace        log every animation change and where the sheep is
+  -h, --help            show this message
+  -V, --version         show the version
 
-configuration is read from ~/.config/hyprsheep/config.toml:
-  sheep     = 1        how many sheep to keep on screen
-  monitors  = \"all\"    \"all\", one name, or [\"eDP-1\", \"HDMI-A-1\"]
-  draggable = true     whether the sheep can be picked up with the mouse
-  pet       = \"...\"    an alternative pet file in the eSheep XML format
+  --sheep N             how many sheep to keep on screen
+  --monitors LIST       \"all\", or names: --monitors eDP-1,HDMI-A-1
+  --draggable[=BOOL]    whether the sheep can be picked up with the mouse
+  --no-draggable        the same as --draggable=false
+  --pet PATH            an alternative pet file in the eSheep XML format
+  --trace[=BOOL]        log every animation change and where the sheep is
+  --no-trace            the same as --trace=false
+
+The same settings can be put in ~/.config/hyprsheep/config.toml, one per line,
+as `sheep = 1` or `monitors = [\"eDP-1\"]`. Anything given on the command
+line wins over the file.
 ";
 
 fn main() {
-    for arg in std::env::args().skip(1) {
-        match arg.as_str() {
-            "-h" | "--help" => return print!("{USAGE}"),
-            "-V" | "--version" => return println!("hyprsheep {}", env!("CARGO_PKG_VERSION")),
-            // Accepted as a flag as well as an environment variable.
-            "--trace" => unsafe { std::env::set_var("HYPRSHEEP_TRACE", "1") },
-            other => {
-                eprintln!("hyprsheep: unknown option `{other}`\n\n{USAGE}");
-                std::process::exit(2);
-            }
-        }
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        return print!("{USAGE}");
+    }
+    if args.iter().any(|a| a == "-V" || a == "--version") {
+        return println!("hyprsheep {}", env!("CARGO_PKG_VERSION"));
     }
 
-    let cfg = config::Config::load();
+    // The file sets the defaults; the command line overrides them.
+    let mut cfg = config::Config::load();
+    if let Err(e) = cfg.apply_args(args) {
+        eprintln!("hyprsheep: {e}\n\n{USAGE}");
+        std::process::exit(2);
+    }
+    let cfg = cfg;
     let (pet, sheet) = match load_pet(&cfg) {
         Ok(v) => v,
         Err(e) => {

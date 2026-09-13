@@ -213,9 +213,15 @@ impl Sheep {
         }
     }
 
-    /// The window the sheep is standing on, if any.
-    pub fn resting_on(&self) -> Option<u64> {
-        self.resting_on
+    /// The window the sheep is actually standing on.
+    ///
+    /// The stored reference is deliberately kept for a moment after the sheep
+    /// steps off an edge, so it can be nudged back on; this reports only real
+    /// support.
+    pub fn standing_on(&self, world: &World, tile: f64) -> Option<u64> {
+        let id = self.resting_on?;
+        let r = world.find(id)?;
+        self.stands_on(r, tile, true).then_some(id)
     }
 
     /// Start `id` directly, rather than via the spawn table. Used for
@@ -361,11 +367,6 @@ impl Sheep {
         if self.step >= self.steps {
             if anim.action == Action::Flip {
                 self.flipped = !self.flipped;
-            }
-            // Let go of a window we are no longer on, so that what comes next
-            // is chosen against the truth rather than a stale claim.
-            if !supported_now {
-                self.resting_on = None;
             }
             self.update_situation(world, tile, supported_now);
             return match pet.choose(&anim.next, self.situation) {

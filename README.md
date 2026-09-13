@@ -18,27 +18,38 @@ monitors.
 cargo run --release
 ```
 
-Run with `--trace` (or set `HYPRSHEEP_TRACE=1`) to log each animation change,
-where the sheep is, and which window it is standing on. `--help` lists the
-options.
-
 Nothing needs installing: the sprite sheet and the animation definitions are
 baked into the binary.
 
 ## Configuration
 
-Optional, and only if you want it. `~/.config/hyprsheep/config.toml`:
+All optional. Every setting has both a command-line option and a config file
+key, and the command line wins:
+
+```sh
+hyprsheep --sheep 3 --monitors eDP-1,HDMI-A-1 --no-draggable
+hyprsheep --pet ~/pets/green_sheep.xml --trace
+```
 
 ```toml
+# ~/.config/hyprsheep/config.toml
 sheep     = 1      # how many sheep to keep on screen
 monitors  = "all"  # "all", one name, or ["eDP-1", "HDMI-A-1"]
 draggable = true   # whether the sheep can be picked up with the mouse
+trace     = false  # log every animation change and where the sheep is
 # pet     = "~/pets/green_sheep.xml"
 ```
 
-A bad line is reported and its default kept, so a typo cannot leave you
-without a sheep. With `draggable = false` the overlay is click-through
-everywhere, with no region for the pointer to catch on.
+`--help` lists the lot. Booleans can be written `--draggable`,
+`--no-draggable` or `--draggable=false`, and values as either `--sheep 3` or
+`--sheep=3`. `HYPRSHEEP_TRACE=1` is equivalent to `--trace`.
+
+A bad line in the file is reported and its default kept, so a typo cannot
+leave you without a sheep; a bad command-line option stops instead, since you
+are standing right there to fix it.
+
+With `draggable = false` the overlay is click-through everywhere, with no
+region for the pointer to catch on.
 
 `pet` loads an alternative pet in the same XML format, sprite sheet and all -
 these files are self-contained. The green sheep that ships with web-esheep

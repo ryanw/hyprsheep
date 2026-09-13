@@ -95,8 +95,6 @@ pub struct Overlay {
     cfg: Config,
     dirty: Arc<AtomicBool>,
     last_refresh: Instant,
-    /// Log every animation change; set HYPRSHEEP_TRACE=1.
-    trace: bool,
 }
 
 pub fn run(sheet: Sheet, pet: Pet, cfg: Config) -> Result<(), String> {
@@ -138,7 +136,6 @@ pub fn run(sheet: Sheet, pet: Pet, cfg: Config) -> Result<(), String> {
         cfg,
         dirty,
         last_refresh: Instant::now(),
-        trace: std::env::var_os("HYPRSHEEP_TRACE").is_some(),
     };
 
     // Outputs already present are announced during the first roundtrip, which
@@ -293,7 +290,7 @@ impl Overlay {
                 steps += 1;
                 // Log inside the loop: several steps can run between frames,
                 // and sampling afterwards hides the transitions in between.
-                if self.trace && pen.sheep.animation != before {
+                if self.cfg.trace && pen.sheep.animation != before {
                     let name = self
                         .pet
                         .get(pen.sheep.animation)
@@ -307,7 +304,7 @@ impl Overlay {
                         pen.sheep.x,
                         pen.sheep.y,
                         if pen.sheep.flipped { "flipped " } else { "" },
-                        match pen.sheep.resting_on() {
+                        match pen.sheep.standing_on(&self.world, self.tile) {
                             Some(id) => format!("on window {id:#x}"),
                             None => "airborne".to_string(),
                         }
