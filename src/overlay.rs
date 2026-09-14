@@ -57,6 +57,11 @@ const SETTLE: Duration = Duration::from_secs(2);
 const IDLE_REFRESH: Duration = Duration::from_secs(2);
 /// Guard against a burst of catch-up steps after the compositor stalls us.
 const MAX_STEPS_PER_FRAME: usize = 8;
+/// How long a sheep on a workspace nobody is looking at will typically put up
+/// with that before coming out onto the one they are. Rolled against the
+/// length of every step it takes, so the rate is the same whether the sheep is
+/// hurrying or fast asleep.
+const WANDER: Duration = Duration::from_secs(45);
 /// How often the pointer's position is re-read while the sheep care where it
 /// is. Often enough to notice the mouse coming to rest, rarely enough to be
 /// one very small socket query a few times a second.
@@ -76,6 +81,10 @@ const FLICK: Duration = Duration::from_millis(120);
 struct Pen {
     sheep: Sheep,
     next_step: Instant,
+    /// Whether the sheep is on a workspace that is being shown, and so is
+    /// drawn, clickable, and in the way of the rest of the flock. Worked out
+    /// once a tick rather than per sheep per panel per frame.
+    visible: bool,
     /// When the step the sheep is part-way through was taken, and how long it
     /// holds for. Together they say how far along that step we are now, which
     /// is how far between its two poses the sprite should be drawn.
@@ -84,6 +93,15 @@ struct Pen {
     /// The pose actually on screen: the sheep's last two, blended. With
     /// smoothing off this is simply the sheep's current pose.
     shown: Pose,
+}
+
+/// Where a companion sheep starts: everything its parent dictates about it.
+struct Start {
+    animation: u32,
+    x: f64,
+    y: f64,
+    rand_s: f64,
+    workspace: Option<i64>,
 }
 
 /// One output's overlay surface.
@@ -372,24 +390,30 @@ impl Overlay {
         });
     }
 
-    fn add_sheep(&mut self, is_child: bool, start: Option<(u32, f64, f64, f64)>) {
+    fn add_sheep(&mut self, is_child: bool, start: Option<Start>) {
         let mut sheep = Sheep::new(is_child);
         sheep.scale = self.cfg.scale;
         sheep.speed = self.cfg.speed;
         sheep.climb_windows = self.cfg.climb_windows;
+        sheep.workspaces = self.cfg.workspaces;
         let mut events = Vec::new();
         match start {
-            Some((animation, x, y, rand_s)) => {
-                sheep.x = x;
-                sheep.y = y;
-                sheep.set_rand_s(rand_s);
-                sheep.begin(&self.pet, &self.world, self.tile, animation, &mut events);
+            Some(at) => {
+                sheep.x = at.x;
+                sheep.y = at.y;
+                sheep.set_rand_s(at.rand_s);
+                // A companion belongs to its parent's workspace, not to
+                // whatever its monitor happens to be showing: a bathtub on
+                // another workspace is no use to the sheep diving into it.
+                sheep.workspace = at.workspace;
+                sheep.begin(&self.pet, &self.world, self.tile, at.animation, &mut events);
             }
             None => sheep.spawn(&self.pet, &self.world, self.tile, &mut events),
         }
         let now = Instant::now();
         self.flock.push(Pen {
             shown: sheep.pose(),
+            visible: sheep.shown(&self.world, self.tile),
             sheep,
             next_step: now,
             step_at: now,
@@ -400,10 +424,10 @@ impl Overlay {
 
     fn handle(&mut self, events: Vec<Event>) {
         for e in events {
-            if let Event::SpawnChild { animation, x, y, rand_s } = e {
+            if let Event::SpawnChild { animation, x, y, rand_s, workspace } = e {
                 // A companion is a fully independent sheep that dies rather
                 // than respawning when its chain ends.
-                self.add_sheep(true, Some((animation, x, y, rand_s)));
+                self.add_sheep(true, Some(Start { animation, x, y, rand_s, workspace }));
             }
         }
     }
@@ -486,6 +510,28 @@ impl Overlay {
             self.cursor_at.filter(|_| self.cursor_since.elapsed() >= CURSOR_STILL);
     }
 
+    /// Work out which sheep are on a workspace that is being shown.
+    ///
+    /// Cached on the pen because it is asked several times a frame - once for
+    /// the scene, once per panel while drawing, once per click - and answering
+    /// it means finding which monitor the sheep is standing on.
+    fn mark_visible(&mut self) {
+        for pen in &mut self.flock {
+            let was = pen.visible;
+            pen.visible = pen.sheep.shown(&self.world, self.tile);
+            if self.cfg.trace && pen.visible != was {
+                let screen = pen.sheep.screen(&self.world, self.tile);
+                println!(
+                    "     {} on workspace {:?}, mon {} showing {}",
+                    if pen.visible { "in sight" } else { "out of sight" },
+                    pen.sheep.workspace,
+                    screen.id,
+                    screen.workspace
+                );
+            }
+        }
+    }
+
     /// How often the window layout is worth re-reading: often enough to
     /// follow a drag while one might be going on, rarely once it is over.
     ///
@@ -513,9 +559,12 @@ impl Overlay {
     }
 
     /// How the flock currently looks, in the terms the drawing code uses.
+    /// Sheep on a workspace nobody is looking at are not in it, so that one
+    /// coming or going counts as the scene having changed.
     fn scene(&self) -> Vec<Look> {
         self.flock
             .iter()
+            .filter(|pen| pen.visible)
             .map(|pen| {
                 let (s, at) = (&pen.sheep, &pen.shown);
                 Look {
@@ -549,9 +598,13 @@ impl Overlay {
     fn tick(&mut self) {
         self.refresh_world();
         self.refresh_cursor();
+        self.mark_visible();
         // Each sheep collides with where the others are now, which the world
         // query knows nothing about: they are ours, not the compositor's.
-        self.world.flock = self.flock.iter().map(|p| p.sheep.bounds(self.tile)).collect();
+        // Only the sheep on show are in it: one on a workspace nobody is
+        // looking at is not in the way of a sheep that can be seen.
+        self.world.flock =
+            self.flock.iter().filter(|p| p.visible).map(|p| p.sheep.bounds(self.tile)).collect();
 
         let now = Instant::now();
         let mut events = Vec::new();
@@ -590,6 +643,24 @@ impl Overlay {
                         }
                     );
                 }
+                // A sheep nobody can see gets the occasional urge to give up
+                // on its own workspace and come out onto the one being looked
+                // at. Rolled against the length of the step just taken, so
+                // the odds work out the same per second however fast or slow
+                // the sheep is living.
+                if self.cfg.workspaces
+                    && !pen.sheep.dragging
+                    && !pen.sheep.shown(&self.world, self.tile)
+                    && fastrand::f64() < delay.as_secs_f64() / WANDER.as_secs_f64()
+                {
+                    pen.sheep.wander_on(&self.pet, &self.world, self.tile);
+                    if self.cfg.trace {
+                        println!(
+                            "     wandered onto workspace {:?} at ({:>6.0},{:>5.0})",
+                            pen.sheep.workspace, pen.sheep.x, pen.sheep.y
+                        );
+                    }
+                }
             }
             // If we fell far behind, resynchronise rather than sprinting.
             if steps == MAX_STEPS_PER_FRAME && now > pen.next_step {
@@ -607,6 +678,9 @@ impl Overlay {
         for i in dead.into_iter().rev() {
             self.flock.remove(i);
         }
+        // Again: a sheep may have walked onto another screen, or come out onto
+        // the workspace being looked at, since the tick began.
+        self.mark_visible();
         self.handle(events);
 
         self.top_up_flock();
@@ -669,6 +743,9 @@ impl Overlay {
     /// The topmost sheep whose sprite covers a global point.
     fn sheep_at(&self, x: f64, y: f64) -> Option<usize> {
         self.flock.iter().rposition(|pen| {
+            if !pen.visible {
+                return false;
+            }
             let top = pen.shown.y + pen.shown.offset_y;
             x >= pen.shown.x && x < pen.shown.x + self.tile && y >= top && y < top + self.tile
         })
@@ -809,10 +886,12 @@ impl Overlay {
         let mut strip = vec![0u8; (dev * 4) as usize];
         let mut spans: Vec<(i32, i32)> = Vec::new();
 
-        for pen in &self.flock {
+        for pen in self.flock.iter().filter(|p| p.visible) {
             let (s, at) = (&pen.sheep, &pen.shown);
             // Global position translated into this output's own space; a sheep
             // straddling two outputs is drawn on both and clipped by each.
+            // Which workspace the *other* output is showing does not come into
+            // it: a sheep halfway across a seam is on show or it is not.
             let lx = at.x - panel.origin.0;
             let ly = at.y + at.offset_y - panel.origin.1;
             if lx + self.tile <= 0.0

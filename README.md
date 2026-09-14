@@ -7,7 +7,9 @@ windows, climbs the sides, falls when the window it was standing on closes,
 and occasionally stops for a nap. You can pick it up with the mouse, and
 throw it. Leave the mouse sitting still near one and it will come over to
 look. Keep a few and they notice each other: a sheep that walks into another
-usually turns round, though now and then one wanders on past.
+usually turns round, though now and then one wanders on past. Each sheep
+belongs to one workspace, and turns up on the one you are looking at sooner or
+later.
 
 ![Screenshot of hyprsheep](assets/screenshot.png)
 
@@ -33,7 +35,7 @@ key, and the command line wins:
 
 ```sh
 hyprsheep --sheep 3 --scale 2 --speed 1.5 --monitors eDP-1,HDMI-A-1
-hyprsheep --smooth 0 --no-cursor
+hyprsheep --smooth 0 --no-cursor --no-workspaces
 hyprsheep --pet ~/pets/green_sheep.xml --trace
 ```
 
@@ -48,6 +50,7 @@ draggable = true   # whether the sheep can be picked up with the mouse
 throw     = true   # whether letting go of a moving sheep throws it
 trace     = false  # log every animation change and where the sheep is
 cursor    = true   # whether the sheep notice a mouse left sitting still
+workspaces = true  # whether a sheep belongs to one workspace at a time
 climb_windows = false  # whether window sides are solid and climbable
 hide_fullscreen = true # whether to keep off a screen showing a fullscreen window
 # pet     = "~/pets/green_sheep.xml"
@@ -100,6 +103,43 @@ behaviour.
 its own idea and can be hurried along; a throw is the mouse's own velocity
 carried on, so it flies at the speed it was thrown at whatever pace the sheep
 is living at.
+
+With `workspaces = true`, which is the default, a sheep belongs to one
+workspace: it is drawn only while the monitor it is standing on is showing
+that workspace, the way your windows are. Switch away and the sheep goes with
+the workspace it was on. It does not stop - like a sheep behind a fullscreen
+window it carries on walking and napping out of sight - so switching back
+finds it wherever it has got to.
+
+Two things bring a sheep to the workspace you are looking at. It still walks
+across the seam between monitors, and crossing one joins the workspace of the
+screen it has walked onto: two monitors showing different workspaces are two
+different rooms, and a sheep walking from one into the other is in the room it
+has arrived in. The crossing itself is what moves it, so it is in sight the
+whole way over rather than blinking out halfway across.
+
+The other is simply giving up. A sheep on a workspace nobody has looked at for
+a while - about three quarters of a minute, on average - comes out onto the one
+being looked at now, walking in from the near side of the screen. Since nobody
+could see where it was, nothing is lost by deciding it had wandered over there
+anyway, and walking in beats appearing out of thin air in the middle of the
+screen. So a sheep follows you around: leave a workspace and it turns up on the
+new one a little later.
+
+A companion sheep is on its parent's workspace rather than its monitor's, which
+matters for the bathtub: a tub on the workspace you happen to be looking at
+would be a tub with no sheep diving into it.
+
+A sheep nobody can see is nobody's obstacle either, and nothing is in its way:
+the flock notices only the sheep that are on show. The windows are the one
+thing it keeps walking among regardless, since Hyprland only says where the
+windows of the workspace it is showing are - so a sheep out of sight walks the
+ledges of the workspace in front of you rather than its own, and may well be
+falling when you switch back to it. Falling is a thing sheep do.
+
+With `workspaces = false` there is one herd on every workspace at once, always
+in sight, which is what the reference does - a browser page has no workspaces
+to be on.
 
 With `cursor = true`, which is the default, a mouse pointer left sitting still
 is something in the sheep's world. One walking within a few hundred pixels of
@@ -175,10 +215,11 @@ to, and the animation plays out its remaining steps sliding along the top of
 the window. Screen edges and the floor still stop them, being the borders the
 file was written against.
 
-Window geometry comes from Hyprland's IPC. `.socket.sock` answers `j/clients`
-and `j/monitors`, the client list also saying which monitors are showing
-something fullscreen; `.socket2.sock` streams an event per compositor change,
-which is used only as a hint to re-read the layout.
+Window geometry comes from Hyprland's IPC. `.socket.sock` answers `j/clients`,
+`j/monitors` and `j/cursorpos` - the monitor list saying which workspace each
+one is showing, and the client list which monitors are showing something
+fullscreen; `.socket2.sock` streams an event per compositor change, which is
+used only as a hint to re-read the layout.
 
 The sheep live in one global coordinate space spanning every monitor, so a
 sheep can walk off one screen and onto the next. Each output gets its own

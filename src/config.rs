@@ -51,6 +51,10 @@ pub struct Config {
     /// come over to look, and bump their nose on it rather than walking
     /// through. A pointer in motion is ignored either way.
     pub cursor: bool,
+    /// Whether each sheep belongs to one workspace, and is drawn only while
+    /// that workspace is the one being shown. Off, a sheep belongs to none of
+    /// them and is on all of them at once, as the reference is.
+    pub workspaces: bool,
     /// Whether to take the sheep off a monitor showing a fullscreen window.
     /// The sheep carries on living there unseen; it is only not drawn.
     pub hide_fullscreen: bool,
@@ -73,6 +77,7 @@ impl Default for Config {
             throw: true,
             climb_windows: true,
             cursor: true,
+            workspaces: true,
             hide_fullscreen: true,
             pet: None,
             trace: false,
@@ -149,6 +154,7 @@ impl Config {
                 ("throw", Value::Bool(b)) => cfg.throw = *b,
                 ("climb_windows", Value::Bool(b)) => cfg.climb_windows = *b,
                 ("cursor", Value::Bool(b)) => cfg.cursor = *b,
+                ("workspaces", Value::Bool(b)) => cfg.workspaces = *b,
                 ("hide_fullscreen", Value::Bool(b)) => cfg.hide_fullscreen = *b,
                 ("monitors", Value::Str(s)) if s == "all" => cfg.monitors = Monitors::All,
                 ("monitors", Value::List(l)) => cfg.monitors = Monitors::Only(l.clone()),
@@ -238,6 +244,8 @@ impl Config {
                 "--no-climb-windows" => self.climb_windows = false,
                 "--cursor" => self.cursor = flag(inline.as_deref(), &key)?,
                 "--no-cursor" => self.cursor = false,
+                "--workspaces" => self.workspaces = flag(inline.as_deref(), &key)?,
+                "--no-workspaces" => self.workspaces = false,
                 "--hide-fullscreen" => self.hide_fullscreen = flag(inline.as_deref(), &key)?,
                 "--no-hide-fullscreen" => self.hide_fullscreen = false,
                 "--trace" => self.trace = flag(inline.as_deref(), &key)?,
@@ -379,6 +387,7 @@ mod tests {
             throw = false
             climb_windows = true
             cursor = false
+            workspaces = false
             monitors = ["eDP-1", "HDMI-A-1"]
             pet = "/tmp/green.xml"
             "#,
@@ -391,6 +400,7 @@ mod tests {
         assert!(!c.throw);
         assert!(c.climb_windows);
         assert!(!c.cursor);
+        assert!(!c.workspaces);
         assert_eq!(
             c.monitors,
             Monitors::Only(vec!["eDP-1".into(), "HDMI-A-1".into()])
@@ -455,6 +465,8 @@ mod tests {
         assert!(!args(&["--no-cursor"]).unwrap().cursor);
         assert!(!args(&["--cursor=false"]).unwrap().cursor);
         assert!(args(&["--no-cursor", "--cursor"]).unwrap().cursor);
+        assert!(!args(&["--no-workspaces"]).unwrap().workspaces);
+        assert!(!args(&["--workspaces=false"]).unwrap().workspaces);
     }
 
     #[test]

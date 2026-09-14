@@ -68,6 +68,7 @@ impl Monitor {
             w: self.width,
             h: self.height,
             reserved: self.reserved,
+            workspace: self.active_workspace,
         }
     }
 }

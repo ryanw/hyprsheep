@@ -46,6 +46,9 @@ pub struct Screen {
     pub h: f64,
     /// Space claimed by bars: left, top, right, bottom.
     pub reserved: (f64, f64, f64, f64),
+    /// The workspace this monitor is showing at the moment. A sheep is on
+    /// show only while this is the workspace it belongs to.
+    pub workspace: i64,
 }
 
 impl Screen {
@@ -118,12 +121,15 @@ impl World {
 pub enum Event {
     /// Create an independent companion sheep.
     ///
+    /// The workspace is the parent's too, and for a plainer reason: a bathtub
+    /// must be on the same workspace as the sheep diving into it.
+    ///
     /// `rand_s` is the parent's, not a fresh one: a companion's animations are
     /// written to be timed against the sheep that called it on, and the pet
     /// file times them with `randS`. The bathtub waits out the dive by
     /// counting the steps the dive takes, which is a length the parent's
     /// `randS` decides; with a roll of its own the tub splashes early or late.
-    SpawnChild { animation: u32, x: f64, y: f64, rand_s: f64 },
+    SpawnChild { animation: u32, x: f64, y: f64, rand_s: f64, workspace: Option<i64> },
     /// This sheep reached a terminal animation and should be removed.
     Died,
 }
@@ -183,6 +189,14 @@ pub struct Sheep {
     /// sheep walks straight through their sides, as the reference does; on, it
     /// bumps into them and can climb them the way it climbs a screen edge.
     pub climb_windows: bool,
+    /// Whether this sheep belongs to a workspace at all. Off, it has none and
+    /// is on every one of them, which is what the reference does and what a
+    /// browser page can do.
+    pub workspaces: bool,
+    /// The workspace the sheep is on, if it is on one. It is only ever drawn
+    /// on a monitor showing this workspace; the rest of the time it carries
+    /// on living out of sight.
+    pub workspace: Option<i64>,
 
     /// The pose the current step set out from. Equal to the current pose
     /// whenever the sheep was placed rather than moved, which is what stops a
@@ -204,6 +218,9 @@ pub struct Sheep {
     /// A sheep this one has decided to walk on past rather than turn at. Held
     /// until the two are clear of each other, for the same reason.
     passing_sheep: Option<u64>,
+    /// The screen the sheep was on as of its last step. Crossing onto
+    /// another one is what moves it between workspaces.
+    on_screen: i64,
     /// A resting place of the pointer this sheep has already been over to
     /// look at. It stops being interesting once looked at, so that a sheep
     /// does not spend its life pacing around an abandoned mouse; move the
@@ -284,6 +301,8 @@ impl Sheep {
             scale: 1.0,
             speed: 1.0,
             climb_windows: false,
+            workspaces: false,
+            workspace: None,
             prev: Pose { x: 0.0, y: 0.0, offset_y: 0.0, opacity: 1.0 },
             rand_s: fastrand::f64() * 100.0,
             toss: None,
@@ -291,6 +310,7 @@ impl Sheep {
             passing: None,
             passing_sheep: None,
             met_pointer: None,
+            on_screen: i64::MIN,
             situation: Situation::default(),
             steps: 1,
         }
@@ -341,6 +361,7 @@ impl Sheep {
                 w: 0.0,
                 h: 0.0,
                 reserved: (0.0, 0.0, 0.0, 0.0),
+                workspace: -1,
             })
     }
 
@@ -406,8 +427,74 @@ impl Sheep {
                 x: screen.x + eval_or(&c.x, &ctx, 0.0),
                 y: screen.y + eval_or(&c.y, &ctx, 0.0),
                 rand_s: self.rand_s,
+                workspace: self.workspace,
             });
         }
+    }
+
+    /// Whether anyone can see the sheep: whether the screen it is on is
+    /// showing the workspace it belongs to.
+    ///
+    /// A sheep that belongs to no workspace - which is every sheep with
+    /// `workspaces = false` - is always on show.
+    pub fn shown(&self, world: &World, tile: f64) -> bool {
+        match self.workspace {
+            None => true,
+            Some(ws) => ws == self.screen(world, tile).workspace,
+        }
+    }
+
+    /// Notice having crossed onto another screen, and join whatever that
+    /// screen is showing.
+    ///
+    /// This is what keeps a sheep in sight as it walks over a seam: two
+    /// monitors can be showing different workspaces, and a sheep crossing
+    /// between them belongs to the one it has walked onto. It is the other
+    /// way back into view for a sheep that is out of sight, besides giving up
+    /// on its own workspace and coming out on the current one.
+    fn follow_screen(&mut self, world: &World, tile: f64) {
+        let screen = self.screen(world, tile);
+        if screen.id == self.on_screen {
+            return;
+        }
+        self.on_screen = screen.id;
+        if self.workspace.is_some() {
+            self.workspace = Some(screen.workspace);
+        }
+    }
+
+    /// Give up on a workspace nobody is looking at and come out onto the one
+    /// they are.
+    ///
+    /// Only ever called on a sheep that is out of sight, which is what lets
+    /// it be moved: it walks in from the near edge of the screen rather than
+    /// appearing out of nowhere in the middle of it. Nobody saw where it was,
+    /// so nothing is lost by deciding it was over there all along.
+    pub fn wander_on(&mut self, pet: &Pet, world: &World, tile: f64) {
+        let screen = self.screen(world, tile);
+        self.workspace = Some(screen.workspace);
+        self.on_screen = screen.id;
+
+        // Without a walk in the pet file there is nothing to walk in with, so
+        // the sheep simply steps into view where it stands.
+        let Some(walk) = pet.by_name("walk") else { return };
+        let id = walk.id;
+        let ctx = self.ctx(world, pet, tile);
+        let dx = eval_or(&walk.end.x, &ctx, 0.0);
+
+        let from_left = self.x + tile / 2.0 < screen.x + screen.w / 2.0;
+        self.x = if from_left { screen.x } else { screen.right() - tile };
+        self.y = screen.floor() - tile;
+        // Turned to face into the screen rather than straight back off it.
+        self.flipped = (dx < 0.0) == from_left;
+        self.resting_on = None;
+        self.toss = None;
+        self.passing = None;
+        self.passing_sheep = None;
+        self.met_pointer = None;
+        let mut ignored = Vec::new();
+        self.enter(pet, world, tile, id, &mut ignored);
+        self.settle();
     }
 
     /// The window the sheep is actually standing on.
@@ -424,6 +511,9 @@ impl Sheep {
     /// Start `id` directly, rather than via the spawn table. Used for
     /// companion sheep, whose animation and position the parent dictates.
     pub fn begin(&mut self, pet: &Pet, world: &World, tile: f64, id: u32, events: &mut Vec<Event>) {
+        // Placed rather than arrived, so this is where it already was: the
+        // first step must not read it as having crossed onto a new screen.
+        self.on_screen = self.screen(world, tile).id;
         self.enter(pet, world, tile, id, events);
         self.settle();
     }
@@ -442,6 +532,14 @@ impl Sheep {
         self.y = screen.y + eval_or(&y, &ctx, 0.0);
         self.flipped = false;
         self.resting_on = None;
+        // A sheep turns up on whatever the screen it arrives on is showing -
+        // which at the very edge of one can be the next screen along, since
+        // the spawn points are the file's and reach the whole width of it.
+        let arrived = self.screen(world, tile);
+        self.on_screen = arrived.id;
+        if self.workspaces {
+            self.workspace = Some(arrived.workspace);
+        }
         self.enter(pet, world, tile, next, events);
         self.settle();
     }
@@ -562,6 +660,12 @@ impl Sheep {
     /// spawned together, or dropped on one another - walk apart rather than
     /// being shoved aside, and one already being walked past stays passable.
     fn sheep_face(&self, world: &World, tile: f64, dir: f64) -> Option<(u64, f64)> {
+        // Out of sight is out of the way: a sheep on a workspace nobody is
+        // looking at shares the screen with the flock but not the world. The
+        // host leaves it out of the flock for the same reason.
+        if !self.shown(world, tile) {
+            return None;
+        }
         let faces = world
             .flock
             .iter()
@@ -639,6 +743,25 @@ impl Sheep {
 
     /// Advance one animation step. Returns how long to wait before the next.
     pub fn step(
+        &mut self,
+        pet: &Pet,
+        world: &World,
+        tile: f64,
+        events: &mut Vec<Event>,
+    ) -> Duration {
+        let wait = self.take_step(pet, world, tile, events);
+        // Joining the workspace of the screen it has ended up on belongs
+        // here, after the movement rather than before it: a step that has
+        // carried the sheep over a seam but not yet onto the new screen's
+        // workspace is a step where it cannot be seen at all, and a sheep
+        // that blinks out for a step in the middle of a crossing is worse
+        // than one that takes a step to notice.
+        self.follow_screen(world, tile);
+        wait
+    }
+
+    /// The step itself: everything the pet file has to say about it.
+    fn take_step(
         &mut self,
         pet: &Pet,
         world: &World,
@@ -1094,8 +1217,10 @@ mod tests {
         Pet::parse(XML).unwrap()
     }
 
+    /// A monitor showing workspace 1, which is what the sheep in most of
+    /// these tests belong to when they belong to one at all.
     fn screen(id: i64, x: f64, w: f64, h: f64) -> Screen {
-        Screen { id, x, y: 0.0, w, h, reserved: (0.0, 0.0, 0.0, 0.0) }
+        Screen { id, x, y: 0.0, w, h, reserved: (0.0, 0.0, 0.0, 0.0), workspace: 1 }
     }
 
     fn world() -> World {
@@ -1683,6 +1808,217 @@ mod tests {
         furthest
     }
 
+    /// Two monitors side by side showing different workspaces, which is the
+    /// whole point of the seam: a sheep crossing it changes which one it is
+    /// on, and stays in sight either way.
+    fn two_workspaces() -> World {
+        let mut w = two_screens();
+        w.screens[0].workspace = 1;
+        w.screens[1].workspace = 5;
+        w
+    }
+
+    /// A sheep that belongs to a workspace, placed on the floor at `x`.
+    fn sheep_on(ws: i64, x: f64) -> Sheep {
+        let mut s = Sheep::new(false);
+        s.workspaces = true;
+        s.workspace = Some(ws);
+        s.x = x;
+        s.y = 1040.0;
+        s
+    }
+
+    #[test]
+    fn a_sheep_arrives_on_whatever_its_screen_is_showing() {
+        let p = pet();
+        let w = two_workspaces();
+        for _ in 0..40 {
+            let mut s = Sheep::new(false);
+            s.workspaces = true;
+            let mut ev = Vec::new();
+            s.spawn(&p, &w, TILE, &mut ev);
+            let screen = s.screen(&w, TILE);
+            assert_eq!(
+                s.workspace,
+                Some(screen.workspace),
+                "arrived on screen {} without joining the workspace it shows",
+                screen.id
+            );
+            assert!(s.shown(&w, TILE), "a sheep that has just arrived is not on show");
+        }
+    }
+
+    /// The reference has no workspaces and neither does a sheep with them
+    /// turned off: it belongs to none, and is on all of them.
+    #[test]
+    fn with_workspaces_off_a_sheep_is_on_every_one() {
+        let p = pet();
+        let mut w = world();
+        let mut s = Sheep::new(false);
+        let mut ev = Vec::new();
+        s.spawn(&p, &w, TILE, &mut ev);
+        assert_eq!(s.workspace, None);
+        assert!(s.shown(&w, TILE));
+        w.screens[0].workspace = 9;
+        assert!(s.shown(&w, TILE), "a sheep on no workspace was taken off screen by a switch");
+    }
+
+    /// Switching the workspace out from under a sheep takes it off screen
+    /// without stopping it: it carries on walking where nobody can see it, as
+    /// it does behind a fullscreen window.
+    #[test]
+    fn a_workspace_switch_takes_the_sheep_off_screen_but_not_out_of_the_world() {
+        let p = pet();
+        let mut w = world();
+        let mut s = sheep_on(1, 900.0);
+        let mut ev = Vec::new();
+        s.begin(&p, &w, TILE, 1, &mut ev);
+        assert!(s.shown(&w, TILE));
+
+        w.screens[0].workspace = 2;
+        assert!(!s.shown(&w, TILE), "still on show after the workspace changed under it");
+
+        let before = s.x;
+        for _ in 0..40 {
+            s.step(&p, &w, TILE, &mut ev);
+        }
+        assert_ne!(before, s.x, "a sheep out of sight stopped living");
+        assert_eq!(s.workspace, Some(1), "it left its own workspace without being asked to");
+    }
+
+    #[test]
+    fn walking_across_a_seam_joins_the_next_screens_workspace() {
+        let p = pet();
+        let w = two_workspaces();
+        // Far enough back that its middle - which is what decides the screen
+        // it is on - is still on the first monitor.
+        let mut s = sheep_on(1, 1850.0);
+        let mut ev = Vec::new();
+        // Facing right, a few steps from the seam.
+        s.flipped = true;
+        s.begin(&p, &w, TILE, 1, &mut ev);
+
+        for _ in 0..200 {
+            s.step(&p, &w, TILE, &mut ev);
+            // In sight the whole way over: it is the crossing itself that
+            // moves it between workspaces, so there is no step where it
+            // belongs to the screen it has left.
+            assert!(s.shown(&w, TILE), "went out of sight at x={}", s.x);
+            if s.screen(&w, TILE).id == 1 {
+                assert_eq!(s.workspace, Some(5), "crossed the seam without joining ws 5");
+                return;
+            }
+        }
+        panic!("never crossed the seam (ended at x={})", s.x);
+    }
+
+    /// The other way round: a sheep nobody can see walks onto the next screen
+    /// and is in sight there, having wandered in from the neighbouring one.
+    #[test]
+    fn a_sheep_out_of_sight_can_walk_onto_a_screen_where_it_is_seen() {
+        let p = pet();
+        let mut w = two_workspaces();
+        // The first monitor has switched away from the sheep's workspace.
+        w.screens[0].workspace = 3;
+        let mut s = sheep_on(1, 1850.0);
+        let mut ev = Vec::new();
+        s.flipped = true;
+        s.begin(&p, &w, TILE, 1, &mut ev);
+        assert!(!s.shown(&w, TILE));
+
+        for _ in 0..200 {
+            s.step(&p, &w, TILE, &mut ev);
+            if s.screen(&w, TILE).id == 1 {
+                assert!(s.shown(&w, TILE), "walked onto a screen showing ws 5 and stayed hidden");
+                return;
+            }
+        }
+        panic!("never crossed the seam (ended at x={})", s.x);
+    }
+
+    #[test]
+    fn a_sheep_out_of_sight_comes_out_onto_the_workspace_being_shown() {
+        let p = pet();
+        let mut w = world();
+        w.screens[0].workspace = 2;
+        let mut s = sheep_on(1, 900.0);
+        let mut ev = Vec::new();
+        s.begin(&p, &w, TILE, 1, &mut ev);
+        assert!(!s.shown(&w, TILE));
+
+        s.wander_on(&p, &w, TILE);
+        assert_eq!(s.workspace, Some(2), "came out onto the wrong workspace");
+        assert!(s.shown(&w, TILE), "came out and still could not be seen");
+        // In from the side, on the floor, rather than appearing out of nowhere
+        // in the middle of the screen.
+        let screen = s.screen(&w, TILE);
+        assert!(
+            s.x == screen.x || s.x == screen.right() - TILE,
+            "came out at x={} rather than at an edge",
+            s.x
+        );
+        assert_eq!(s.y, screen.floor() - TILE, "came out somewhere other than the floor");
+        // And walking inwards, not straight back off the screen.
+        let before = s.x;
+        for _ in 0..4 {
+            s.step(&p, &w, TILE, &mut ev);
+        }
+        let inward = if before == screen.x { s.x > before } else { s.x < before };
+        assert!(inward, "walked off the edge it came in at (x={before} to {})", s.x);
+    }
+
+    /// It comes in from the nearer side, having plausibly been over there.
+    #[test]
+    fn it_comes_out_at_the_edge_it_was_nearest() {
+        let p = pet();
+        let mut w = world();
+        w.screens[0].workspace = 2;
+        for (x, edge) in [(200.0, 0.0), (1700.0, 1920.0 - TILE)] {
+            let mut s = sheep_on(1, x);
+            let mut ev = Vec::new();
+            s.begin(&p, &w, TILE, 1, &mut ev);
+            s.wander_on(&p, &w, TILE);
+            assert_eq!(s.x, edge, "a sheep at x={x} came out at the far edge");
+        }
+    }
+
+    /// A sheep nobody can see is not in the way of one that can be seen, and
+    /// nor is the flock in its way. The host leaves it out of the flock; this
+    /// is the other half, so that it does not turn at sheep it cannot meet.
+    #[test]
+    fn a_sheep_out_of_sight_is_not_stopped_by_the_flock() {
+        let p = pet();
+        let mut w = world_with_a_sheep_at(900.0, 1040.0);
+        w.screens[0].workspace = 2;
+        let mut s = sheep_on(1, 1011.0);
+        let mut ev = Vec::new();
+        s.begin(&p, &w, TILE, 1, &mut ev);
+        let mut furthest = s.x;
+        for _ in 0..200 {
+            s.step(&p, &w, TILE, &mut ev);
+            furthest = furthest.min(s.x);
+        }
+        assert!(furthest < 900.0, "a sheep out of sight was stopped by one it cannot meet");
+    }
+
+    #[test]
+    fn a_companion_is_on_its_parents_workspace() {
+        let p = pet();
+        let mut w = world();
+        // The parent is out of sight, so its bathtub must be too - a tub on
+        // the workspace being looked at would be a tub with no sheep in it.
+        w.screens[0].workspace = 2;
+        let dive = p.by_name("batha").expect("the pet dives into a bath").id;
+        let mut s = sheep_on(1, 900.0);
+        s.y = 200.0;
+        let mut ev = Vec::new();
+        s.begin(&p, &w, TILE, dive, &mut ev);
+        let Some(Event::SpawnChild { workspace, .. }) = ev.first() else {
+            panic!("the dive did not call on a bathtub: {ev:?}");
+        };
+        assert_eq!(*workspace, Some(1), "the bathtub was left on another workspace");
+    }
+
     /// A pointer resting at a point, for a sheep to notice.
     fn world_with_the_pointer_at(x: f64, y: f64) -> World {
         World { pointer: Some((x, y)), ..world() }
@@ -2084,6 +2420,7 @@ mod tests {
                 w: 1440.0,
                 h: 2560.0,
                 reserved: (0.0, 0.0, 0.0, 0.0),
+                workspace: 1,
             }],
             windows: vec![Rect { id: 9, x: 3858.0, y: -26.0, w: 1404.0, h: 1242.0 }],
             flock: vec![],
@@ -2466,7 +2803,8 @@ mod tests {
             diver.y = 1080.0 / 2.0 - (rand_s * 540.0) / 120.0 - TILE;
             diver.begin(&p, &w, TILE, 21, &mut ev);
 
-            let Some(&Event::SpawnChild { animation, x, y, rand_s: childs }) = ev.first() else {
+            let Some(&Event::SpawnChild { animation, x, y, rand_s: childs, .. }) = ev.first()
+            else {
                 panic!("the dive did not call on a bathtub: {ev:?}");
             };
             let mut tub = Sheep::new(true);

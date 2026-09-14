@@ -36,6 +36,8 @@ usage: hyprsheep [options]
   --no-throw            the same as --throw=false
   --cursor[=BOOL]       whether the sheep notice a resting mouse pointer
   --no-cursor           the same as --cursor=false
+  --workspaces[=BOOL]   whether a sheep belongs to one workspace
+  --no-workspaces       the same as --workspaces=false
   --climb-windows[=BOOL]  whether window sides are solid and climbable
   --no-climb-windows    the same as --climb-windows=false
   --hide-fullscreen[=BOOL]  whether to hide on a screen showing fullscreen
