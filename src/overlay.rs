@@ -338,16 +338,17 @@ impl Overlay {
         });
     }
 
-    fn add_sheep(&mut self, is_child: bool, start: Option<(u32, f64, f64)>) {
+    fn add_sheep(&mut self, is_child: bool, start: Option<(u32, f64, f64, f64)>) {
         let mut sheep = Sheep::new(is_child);
         sheep.scale = self.cfg.scale;
         sheep.speed = self.cfg.speed;
         sheep.climb_windows = self.cfg.climb_windows;
         let mut events = Vec::new();
         match start {
-            Some((animation, x, y)) => {
+            Some((animation, x, y, rand_s)) => {
                 sheep.x = x;
                 sheep.y = y;
+                sheep.set_rand_s(rand_s);
                 sheep.begin(&self.pet, &self.world, self.tile, animation, &mut events);
             }
             None => sheep.spawn(&self.pet, &self.world, self.tile, &mut events),
@@ -365,10 +366,10 @@ impl Overlay {
 
     fn handle(&mut self, events: Vec<Event>) {
         for e in events {
-            if let Event::SpawnChild { animation, x, y } = e {
+            if let Event::SpawnChild { animation, x, y, rand_s } = e {
                 // A companion is a fully independent sheep that dies rather
                 // than respawning when its chain ends.
-                self.add_sheep(true, Some((animation, x, y)));
+                self.add_sheep(true, Some((animation, x, y, rand_s)));
             }
         }
     }

@@ -109,7 +109,13 @@ impl World {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Event {
     /// Create an independent companion sheep.
-    SpawnChild { animation: u32, x: f64, y: f64 },
+    ///
+    /// `rand_s` is the parent's, not a fresh one: a companion's animations are
+    /// written to be timed against the sheep that called it on, and the pet
+    /// file times them with `randS`. The bathtub waits out the dive by
+    /// counting the steps the dive takes, which is a length the parent's
+    /// `randS` decides; with a roll of its own the tub splashes early or late.
+    SpawnChild { animation: u32, x: f64, y: f64, rand_s: f64 },
     /// This sheep reached a terminal animation and should be removed.
     Died,
 }
@@ -272,6 +278,12 @@ impl Sheep {
         }
     }
 
+    /// Adopt a companion's `randS` from the sheep that called it on, so the
+    /// two agree on the lengths their animations are timed against.
+    pub fn set_rand_s(&mut self, rand_s: f64) {
+        self.rand_s = rand_s;
+    }
+
     /// Where the sheep has stepped to.
     pub fn pose(&self) -> Pose {
         Pose { x: self.x, y: self.y, offset_y: self.offset_y, opacity: self.opacity }
@@ -375,6 +387,7 @@ impl Sheep {
                 // in the parent's screen-local space.
                 x: screen.x + eval_or(&c.x, &ctx, 0.0),
                 y: screen.y + eval_or(&c.y, &ctx, 0.0),
+                rand_s: self.rand_s,
             });
         }
     }
@@ -1251,7 +1264,7 @@ mod tests {
 
         // The saucer arrives as a companion, well above the sheep.
         let spawned = ev.iter().find_map(|e| match e {
-            Event::SpawnChild { animation, x, y } if *animation == ship => Some((*x, *y)),
+            Event::SpawnChild { animation, x, y, .. } if *animation == ship => Some((*x, *y)),
             _ => None,
         });
         let (sx, sy) = spawned.expect("scream should bring on the saucer");
@@ -2142,6 +2155,61 @@ mod tests {
             s.step(&p, &w, TILE, &mut ev);
         }
         assert_eq!((s.x, s.y), (x, y), "a caught sheep moved on its own");
+    }
+
+    /// The bathtub does not watch the sheep come down; it counts out the
+    /// steps of the dive and splashes when they run out. The dive's length is
+    /// decided by the diver's `randS`, so the tub has to be counting with the
+    /// same number, or it splashes before the sheep is in it.
+    #[test]
+    fn the_splash_waits_for_the_sheep_to_land() {
+        let p = pet();
+        let w = world();
+        let mut delays = Vec::new();
+        for rand_s in [0.0, 7.0, 23.0, 50.0, 84.0, 99.0] {
+            let mut ev = Vec::new();
+
+            // Spawn 3: in from the right, partway down a screen whose height
+            // this sheep's randS decides.
+            let mut diver = Sheep::new(false);
+            diver.set_rand_s(rand_s);
+            diver.x = 1930.0;
+            diver.y = 1080.0 / 2.0 - (rand_s * 540.0) / 120.0 - TILE;
+            diver.begin(&p, &w, TILE, 21, &mut ev);
+
+            let Some(&Event::SpawnChild { animation, x, y, rand_s: childs }) = ev.first() else {
+                panic!("the dive did not call on a bathtub: {ev:?}");
+            };
+            let mut tub = Sheep::new(true);
+            tub.set_rand_s(childs);
+            tub.x = x;
+            tub.y = y;
+            ev.clear();
+            tub.begin(&p, &w, TILE, animation, &mut ev);
+
+            // Both run at 30ms a step, so they step together.
+            let mut landed = None;
+            let mut steps = 0;
+            while p.get(tub.animation).unwrap().name != "bathz" && steps < 4000 {
+                diver.step(&p, &w, TILE, &mut ev);
+                tub.step(&p, &w, TILE, &mut ev);
+                steps += 1;
+                if landed.is_none() && p.get(diver.animation).unwrap().name != "batha" {
+                    landed = Some(steps);
+                }
+            }
+            assert_eq!(p.get(tub.animation).unwrap().name, "bathz", "randS {rand_s}: no splash");
+            let landed =
+                landed.unwrap_or_else(|| panic!("randS {rand_s}: the tub splashed mid-dive"));
+            delays.push(steps - landed);
+        }
+
+        // However far the sheep had to fall, the water breaks the same number
+        // of steps into its arrival.
+        assert!(
+            delays.windows(2).all(|d| d[0] == d[1]),
+            "the splash drifts with randS: {delays:?}"
+        );
     }
 
     /// The black-sheep meeting is two walks timed to end nose to nose in the
