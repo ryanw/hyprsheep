@@ -4,7 +4,8 @@ A desktop sheep for Hyprland, after the 1995 Windows toy [eSheep][esheep].
 
 The sheep wanders around your screen, walks along the top edges of your
 windows, climbs the sides, falls when the window it was standing on closes,
-and occasionally stops for a nap.
+and occasionally stops for a nap. You can pick it up with the mouse, and
+throw it.
 
 ![Screenshot of hyprsheep](assets/screenshot.png)
 
@@ -42,6 +43,7 @@ speed     = 1      # how fast they live: 2 is twice the pace, 0.5 half
 smooth    = 60     # frames per second to glide between steps; 0 for none
 monitors  = "all"  # "all", one name, or ["eDP-1", "HDMI-A-1"]
 draggable = true   # whether the sheep can be picked up with the mouse
+throw     = true   # whether letting go of a moving sheep throws it
 trace     = false  # log every animation change and where the sheep is
 climb_windows = false  # whether window sides are solid and climbable
 # pet     = "~/pets/green_sheep.xml"
@@ -78,6 +80,17 @@ either way; a walking one is redrawn up to this many times a second.
 
 With `draggable = false` the overlay is click-through everywhere, with no
 region for the pointer to catch on.
+
+A sheep let go of while the mouse is still moving is thrown rather than
+dropped: it keeps the speed and the direction the pointer had, arcs under its
+own gravity, and lands in whatever the pet file says landing looks like. The
+pet format has no animation for an arc - the original only ever dropped the
+sheep straight down - so the falling frames are borrowed and the flight is
+ours, which is the one part of the sheep's motion that is not data. Catching
+it mid-flight ends the throw; so does hitting a wall, a window or the floor.
+Only the last tenth of a second of the drag counts, so a drag that comes to
+rest before you let go is still a drop. `throw = false` restores the original
+behaviour.
 
 With `climb_windows = true` a window is a solid block rather than just a ledge:
 the sheep bumps into its left and right faces and can climb them the way it

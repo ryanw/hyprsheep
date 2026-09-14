@@ -32,6 +32,8 @@ usage: hyprsheep [options]
   --monitors LIST       \"all\", or names: --monitors eDP-1,HDMI-A-1
   --draggable[=BOOL]    whether the sheep can be picked up with the mouse
   --no-draggable        the same as --draggable=false
+  --throw[=BOOL]        whether a flick of the mouse throws the sheep
+  --no-throw            the same as --throw=false
   --climb-windows[=BOOL]  whether window sides are solid and climbable
   --no-climb-windows    the same as --climb-windows=false
   --pet PATH            an alternative pet file in the eSheep XML format

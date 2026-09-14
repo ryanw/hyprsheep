@@ -57,6 +57,10 @@ const SETTLE: Duration = Duration::from_secs(2);
 const IDLE_REFRESH: Duration = Duration::from_secs(2);
 /// Guard against a burst of catch-up steps after the compositor stalls us.
 const MAX_STEPS_PER_FRAME: usize = 8;
+/// How much of the end of a drag decides how hard the sheep was thrown. Long
+/// enough to average out a jittery mouse, short enough that a drag which came
+/// to rest before letting go is a drop rather than a throw.
+const FLICK: Duration = Duration::from_millis(120);
 
 struct Pen {
     sheep: Sheep,
@@ -132,6 +136,10 @@ pub struct Overlay {
     pointer: Option<wl_pointer::WlPointer>,
     /// Index of the sheep the pointer is pressed on, if any.
     pressed: Option<usize>,
+    /// Where the pointer has been during the current drag, most recent last.
+    /// Only the tail end matters: it is there to say how fast the mouse was
+    /// travelling at the moment it let go.
+    trail: Vec<(Instant, f64, f64)>,
     pub exit: bool,
 
     panels: Vec<Panel>,
@@ -197,6 +205,7 @@ pub fn run(sheet: Sheet, pet: Pet, cfg: Config) -> Result<(), String> {
         layer_shell,
         pointer: None,
         pressed: None,
+        trail: Vec::new(),
         exit: false,
         panels: Vec::new(),
         sheet,
@@ -578,6 +587,25 @@ impl Overlay {
         })
     }
 
+    /// How fast the pointer is travelling right now, in logical pixels per
+    /// second, measured across the last `FLICK` of the drag. A drag that came
+    /// to rest before letting go leaves nothing recent enough to measure and
+    /// so reads as still.
+    fn flick(&self) -> (f64, f64) {
+        let now = Instant::now();
+        let recent: Vec<_> = self.trail.iter().filter(|(t, ..)| now - *t <= FLICK).collect();
+        let (Some((t0, x0, y0)), Some((t1, x1, y1))) = (recent.first(), recent.last()) else {
+            return (0.0, 0.0);
+        };
+        let dt = t1.duration_since(*t0).as_secs_f64();
+        // Two samples a hair apart say nothing about speed except by dividing
+        // mouse jitter by nearly zero.
+        if dt < 0.01 {
+            return (0.0, 0.0);
+        }
+        ((x1 - x0) / dt, (y1 - y0) / dt)
+    }
+
     fn draw(&mut self, qh: &QueueHandle<Self>, index: usize) {
         let Some(panel) = self.panels.get_mut(index) else { return };
         // Either this draw brings the panel up to date or it cannot be drawn
@@ -956,6 +984,7 @@ impl PointerHandler for Overlay {
             match event.kind {
                 PointerEventKind::Press { button, .. } if button == BTN_LEFT => {
                     self.pressed = self.sheep_at(x, y);
+                    self.trail.clear();
                 }
                 PointerEventKind::Motion { .. } => {
                     // As in the original, a click alone does not pick the sheep
@@ -968,16 +997,34 @@ impl PointerHandler for Overlay {
                             }
                             pen.sheep.drag_to(x, y, self.tile);
                         }
+                        let now = Instant::now();
+                        self.trail.retain(|(t, _, _)| now - *t <= FLICK);
+                        self.trail.push((now, x, y));
                     }
                 }
                 PointerEventKind::Release { button, .. } if button == BTN_LEFT => {
+                    let (vx, vy) = if self.cfg.throw { self.flick() } else { (0.0, 0.0) };
+                    let mut spawned = Vec::new();
                     if let Some(pen) = self.pressed.take().and_then(|i| self.flock.get_mut(i)) {
                         if pen.sheep.dragging {
-                            pen.sheep.release();
+                            pen.sheep.release(
+                                &self.pet,
+                                &self.world,
+                                self.tile,
+                                vx,
+                                vy,
+                                &mut spawned,
+                            );
+                            pen.next_step = Instant::now();
                         }
                     }
+                    self.trail.clear();
+                    self.handle(spawned);
                 }
-                PointerEventKind::Leave { .. } => self.pressed = None,
+                PointerEventKind::Leave { .. } => {
+                    self.pressed = None;
+                    self.trail.clear();
+                }
                 _ => {}
             }
         }

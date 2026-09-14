@@ -171,6 +171,10 @@ pub struct Sheep {
     rand_s: f64,
     /// The window we are standing on, if any.
     resting_on: Option<u64>,
+    /// Velocity of a throw in flight, in logical pixels per second. Set when
+    /// the sheep is let go of with the mouse still moving, and cleared the
+    /// moment it hits anything.
+    toss: Option<(f64, f64)>,
     /// A window whose side the sheep declined to climb or turn at, and is
     /// walking through. Held until it is clear of that window, so the choice
     /// is made once per encounter rather than re-rolled every step.
@@ -194,6 +198,22 @@ const SIDE_REACH: f64 = 20.0;
 const TURN_AT_FACE: f64 = 0.2;
 /// While being dragged the original ignores physics and ticks at a fixed rate.
 const DRAG_INTERVAL: Duration = Duration::from_millis(50);
+/// How often a thrown sheep is moved along its arc. The pet file's own steps
+/// are far too coarse for one, so a throw runs on its own clock.
+const TOSS_INTERVAL: Duration = Duration::from_millis(25);
+/// Downward acceleration of a thrown sheep, in logical pixels per second
+/// squared. Scaled with the sheep, like every other motion in here, so a big
+/// one arcs like a small one seen from closer up.
+const TOSS_GRAVITY: f64 = 2400.0;
+/// What fraction of its speed a thrown sheep keeps each second. It matters
+/// mostly sideways: it is what stops a hard flick from sailing the width of
+/// three monitors.
+const TOSS_DRAG: f64 = 0.7;
+/// How fast the mouse must still be moving at the moment it lets go for that
+/// to be a throw rather than a drop, in logical pixels per second.
+const TOSS_MIN: f64 = 250.0;
+/// The fastest a sheep can be thrown, however hard the flick.
+const TOSS_MAX: f64 = 2600.0;
 
 impl Sheep {
     pub fn new(is_child: bool) -> Self {
@@ -213,6 +233,7 @@ impl Sheep {
             climb_windows: false,
             prev: Pose { x: 0.0, y: 0.0, offset_y: 0.0, opacity: 1.0 },
             rand_s: fastrand::f64() * 100.0,
+            toss: None,
             resting_on: None,
             passing: None,
             situation: Situation::default(),
@@ -343,6 +364,7 @@ impl Sheep {
     pub fn grab(&mut self, pet: &Pet, world: &World, tile: f64) {
         self.dragging = true;
         self.resting_on = None;
+        self.toss = None;
         if let Some(drag) = pet.by_name("drag") {
             let id = drag.id;
             let mut ignored = Vec::new();
@@ -350,8 +372,29 @@ impl Sheep {
         }
     }
 
-    pub fn release(&mut self) {
+    /// End a drag. `vx` and `vy` are how fast the mouse was still travelling
+    /// as it let go, in logical pixels per second; let go of a sheep while
+    /// moving and it is thrown rather than dropped.
+    pub fn release(
+        &mut self,
+        pet: &Pet,
+        world: &World,
+        tile: f64,
+        vx: f64,
+        vy: f64,
+        events: &mut Vec<Event>,
+    ) {
         self.dragging = false;
+        let speed = vx.hypot(vy);
+        if let Some(fall) = pet.fall_animation().filter(|_| speed >= TOSS_MIN) {
+            // Keep the direction and only cap the pace, so a hard flick still
+            // goes where it was aimed.
+            let scale = TOSS_MAX.min(speed) / speed;
+            self.toss = Some((vx * scale, vy * scale));
+            self.flipped = vx < 0.0;
+            self.begin(pet, world, tile, fall, events);
+            return;
+        }
         // The drag sequence is already past its end, so the next step resolves
         // its transition immediately and gravity takes over from there.
         self.step = self.steps;
@@ -464,6 +507,26 @@ impl Sheep {
             return self.wait(DRAG_INTERVAL.as_millis() as f64);
         }
 
+        // A sheep in flight moves under its own physics rather than the pet
+        // file's: no animation in there describes an arc, so the falling frames
+        // are borrowed and the motion is ours. Borders are still resolved from
+        // the animation's own tables, so the throw ends in whatever the file
+        // says landing looks like.
+        if let Some((vx, vy)) = self.toss {
+            let dt = TOSS_INTERVAL.as_secs_f64();
+            self.x += vx * dt;
+            self.y += vy * dt;
+            self.offset_y = 0.0;
+            self.opacity = 1.0;
+            self.step += 1;
+            let drag = TOSS_DRAG.powf(dt);
+            self.toss = Some((vx * drag, (vy + TOSS_GRAVITY * self.scale * dt) * drag));
+            if let Some(id) = self.resolve(pet, world, tile, &anim, vx, vy, events) {
+                self.enter(pet, world, tile, id, events);
+            }
+            return self.wait(TOSS_INTERVAL.as_millis() as f64);
+        }
+
         let ctx = self.ctx(world, pet, tile);
         let steps = self.steps.max(1);
         // Values ramp linearly from the start endpoint to the end endpoint
@@ -530,6 +593,12 @@ impl Sheep {
 
         // 1. Sequence complete.
         if self.step >= self.steps {
+            // A throw that outlasts the falling sequence keeps falling, rather
+            // than resolving into something else in mid-air.
+            if self.toss.is_some() {
+                self.step = 0;
+                return None;
+            }
             if anim.action == Action::Flip {
                 self.flipped = !self.flipped;
             }
@@ -679,6 +748,8 @@ impl Sheep {
         }
 
         if hit_border {
+            // A throw is over the moment it hits something.
+            self.toss = None;
             self.update_situation(world, tile, supported_now || nudged);
             // A face has already drawn from the same table; rolling again here
             // could contradict the choice that held the sheep in the first
@@ -1625,9 +1696,98 @@ mod tests {
         }
         assert_eq!((s.x, s.y), (x, y), "position moved while dragged");
 
-        s.release();
+        s.release(&p, &w, TILE, 0.0, 0.0, &mut ev);
         s.step(&p, &w, TILE, &mut ev);
         assert_ne!(p.get(s.animation).unwrap().name, "drag", "drag never ended");
+    }
+
+    #[test]
+    fn letting_go_of_a_still_mouse_drops_the_sheep() {
+        let p = pet();
+        let w = world();
+        let mut s = Sheep::new(false);
+        let mut ev = Vec::new();
+        s.spawn(&p, &w, TILE, &mut ev);
+        s.grab(&p, &w, TILE);
+        s.drag_to(500.0, 300.0, TILE);
+        s.release(&p, &w, TILE, 0.0, 0.0, &mut ev);
+
+        let x = s.x;
+        for _ in 0..20 {
+            s.step(&p, &w, TILE, &mut ev);
+        }
+        assert!(s.y > 300.0, "a dropped sheep should fall, got y {}", s.y);
+        assert!((s.x - x).abs() < 40.0, "a dropped sheep should not fly sideways");
+    }
+
+    #[test]
+    fn a_flick_throws_the_sheep_and_it_lands() {
+        let p = pet();
+        let w = world();
+        let mut s = Sheep::new(false);
+        let mut ev = Vec::new();
+        s.spawn(&p, &w, TILE, &mut ev);
+        s.grab(&p, &w, TILE);
+        s.drag_to(500.0, 300.0, TILE);
+        // Let go travelling up and to the right.
+        s.release(&p, &w, TILE, 1200.0, -600.0, &mut ev);
+        assert_eq!(p.get(s.animation).unwrap().name, "fall");
+        assert!(!s.flipped, "a sheep thrown right should face right");
+
+        let start = (s.x, s.y);
+        s.step(&p, &w, TILE, &mut ev);
+        assert!(s.y < start.1, "a sheep thrown upwards should rise first");
+
+        let mut highest = s.y;
+        let mut steps = 0;
+        while s.toss.is_some() && steps < 500 {
+            s.step(&p, &w, TILE, &mut ev);
+            highest = highest.min(s.y);
+            steps += 1;
+        }
+        assert!(s.toss.is_none(), "the throw never ended");
+        assert!(highest < start.1 - 40.0, "the arc never went anywhere");
+        assert!(s.x > start.0 + 100.0, "the sheep was not carried to the right");
+        // It ends on the floor, in whatever the pet file says landing is.
+        assert!(s.y >= w.screens[0].floor() - TILE - 2.0, "it did not come down, y {}", s.y);
+    }
+
+    #[test]
+    fn a_throw_is_capped_but_keeps_its_direction() {
+        let p = pet();
+        let w = world();
+        let mut s = Sheep::new(false);
+        let mut ev = Vec::new();
+        s.spawn(&p, &w, TILE, &mut ev);
+        s.grab(&p, &w, TILE);
+        s.drag_to(900.0, 400.0, TILE);
+        s.release(&p, &w, TILE, -9000.0, -9000.0, &mut ev);
+
+        let (vx, vy) = s.toss.expect("a hard flick is still a throw");
+        assert!(vx.hypot(vy) <= TOSS_MAX + 1.0, "the throw was not capped");
+        assert!((vx - vy).abs() < 1.0, "the aim was not kept");
+        assert!(s.flipped, "a sheep thrown left should face left");
+    }
+
+    #[test]
+    fn picking_a_thrown_sheep_out_of_the_air_ends_the_throw() {
+        let p = pet();
+        let w = world();
+        let mut s = Sheep::new(false);
+        let mut ev = Vec::new();
+        s.spawn(&p, &w, TILE, &mut ev);
+        s.grab(&p, &w, TILE);
+        s.drag_to(500.0, 300.0, TILE);
+        s.release(&p, &w, TILE, 1500.0, 0.0, &mut ev);
+        s.step(&p, &w, TILE, &mut ev);
+
+        s.grab(&p, &w, TILE);
+        assert!(s.toss.is_none(), "a caught sheep is not still in flight");
+        let (x, y) = (s.x, s.y);
+        for _ in 0..20 {
+            s.step(&p, &w, TILE, &mut ev);
+        }
+        assert_eq!((s.x, s.y), (x, y), "a caught sheep moved on its own");
     }
 
     #[test]
@@ -1656,3 +1816,4 @@ mod tests {
         panic!("terminal child never died");
     }
 }
+

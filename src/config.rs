@@ -41,6 +41,9 @@ pub struct Config {
     /// Whether the sheep can be picked up with the mouse. When off, the
     /// overlay stays entirely click-through.
     pub draggable: bool,
+    /// Whether letting go of a moving sheep throws it. Off, it is simply
+    /// dropped from wherever the mouse left it, as the original does.
+    pub throw: bool,
     /// Whether window sides are solid. Off, windows are ledges only; on, the
     /// sheep bumps into their sides and can climb them.
     pub climb_windows: bool,
@@ -60,6 +63,7 @@ impl Default for Config {
             smooth: 60,
             monitors: Monitors::All,
             draggable: true,
+            throw: true,
             climb_windows: true,
             pet: None,
             trace: false,
@@ -133,6 +137,7 @@ impl Config {
                 ("speed", Value::Int(n)) if speed_ok(*n as f64) => cfg.speed = *n as f64,
                 ("smooth", Value::Int(n)) if smooth_ok(*n) => cfg.smooth = *n as u32,
                 ("draggable", Value::Bool(b)) => cfg.draggable = *b,
+                ("throw", Value::Bool(b)) => cfg.throw = *b,
                 ("climb_windows", Value::Bool(b)) => cfg.climb_windows = *b,
                 ("monitors", Value::Str(s)) if s == "all" => cfg.monitors = Monitors::All,
                 ("monitors", Value::List(l)) => cfg.monitors = Monitors::Only(l.clone()),
@@ -216,6 +221,8 @@ impl Config {
                 "--pet" => self.pet = Some(expand_tilde(&value()?, home.as_deref())),
                 "--draggable" => self.draggable = flag(inline.as_deref(), &key)?,
                 "--no-draggable" => self.draggable = false,
+                "--throw" => self.throw = flag(inline.as_deref(), &key)?,
+                "--no-throw" => self.throw = false,
                 "--climb-windows" => self.climb_windows = flag(inline.as_deref(), &key)?,
                 "--no-climb-windows" => self.climb_windows = false,
                 "--trace" => self.trace = flag(inline.as_deref(), &key)?,
@@ -354,6 +361,7 @@ mod tests {
             speed = 2
             smooth = 30
             draggable = false
+            throw = false
             climb_windows = true
             monitors = ["eDP-1", "HDMI-A-1"]
             pet = "/tmp/green.xml"
@@ -364,6 +372,7 @@ mod tests {
         assert_eq!(c.speed, 2.0);
         assert_eq!(c.smooth, 30);
         assert!(!c.draggable);
+        assert!(!c.throw);
         assert!(c.climb_windows);
         assert_eq!(
             c.monitors,
@@ -434,6 +443,8 @@ mod tests {
         assert_eq!(args(&["--sheep", "7"]).unwrap().sheep, 7);
         assert_eq!(args(&["--pet=/a/b.xml"]).unwrap().pet, Some(PathBuf::from("/a/b.xml")));
         // Booleans are bare, negated, or explicit.
+        assert!(!args(&["--no-throw"]).unwrap().throw);
+        assert!(!args(&["--throw=false"]).unwrap().throw);
         assert!(args(&["--draggable"]).unwrap().draggable);
         assert!(!args(&["--no-draggable"]).unwrap().draggable);
         assert!(!args(&["--draggable=false"]).unwrap().draggable);
