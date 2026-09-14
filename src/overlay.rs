@@ -26,7 +26,10 @@ use smithay_client_toolkit::{
         },
         WaylandSurface,
     },
-    shm::{slot::SlotPool, Shm, ShmHandler},
+    shm::{
+        slot::{Buffer, SlotPool},
+        Shm, ShmHandler,
+    },
 };
 use wayland_client::{
     globals::registry_queue_init,
@@ -79,6 +82,23 @@ struct Panel {
     frame_pending: bool,
     /// Whether what is on screen is known to be out of date.
     needs_draw: bool,
+    /// Buffers to paint into, used in turn. See `Canvas`.
+    canvases: Vec<Canvas>,
+    /// The device-pixel size the canvases were made at; they are thrown away
+    /// when the output changes size or scale under them.
+    canvas_size: (i32, i32),
+}
+
+/// A buffer to paint into, and the boxes the sheep were last painted in it.
+///
+/// A sheep is a 32-odd pixel sprite on a screen-sized surface, so a frame
+/// repaints only those boxes and the ones it is leaving behind rather than
+/// the whole buffer. That means the buffer has to survive between frames,
+/// and the compositor holds on to whichever one it was last given — so there
+/// are two, used in turn, each remembering its own contents.
+struct Canvas {
+    buffer: Buffer,
+    painted: Vec<[i32; 4]>,
 }
 
 /// What one sheep looks like on screen, rounded to what actually gets drawn.
@@ -293,6 +313,8 @@ impl Overlay {
             origin,
             frame_pending: false,
             needs_draw: true,
+            canvases: Vec::new(),
+            canvas_size: (0, 0),
         });
     }
 
@@ -496,20 +518,62 @@ impl Overlay {
         let bh = panel.height as i32 * scale;
         let stride = bw * 4;
 
-        let (buffer, canvas) =
-            match panel.pool.create_buffer(bw, bh, stride, wl_shm::Format::Argb8888) {
-                Ok(v) => v,
-                Err(e) => {
-                    eprintln!("hyprsheep: buffer alloc failed: {e}");
-                    return;
-                }
-            };
+        // An output that has changed size or scale invalidates every buffer
+        // made for the old one.
+        if panel.canvas_size != (bw, bh) {
+            panel.canvases.clear();
+            panel.canvas_size = (bw, bh);
+        }
 
-        // Fully transparent everywhere except the sheep.
-        canvas.fill(0);
+        // Paint into whichever buffer the compositor has given back. If it
+        // still holds them all, a fresh one is made and painted in full,
+        // since nothing can be assumed about what is in it.
+        let mut full = false;
+        let free = panel.canvases.iter().position(|c| c.buffer.canvas(&mut panel.pool).is_some());
+        let slot = match free {
+            Some(i) => i,
+            None => {
+                let buffer =
+                    match panel.pool.create_buffer(bw, bh, stride, wl_shm::Format::Argb8888) {
+                        Ok((buffer, _)) => buffer,
+                        Err(e) => {
+                            eprintln!("hyprsheep: buffer alloc failed: {e}");
+                            return;
+                        }
+                    };
+                full = true;
+                // Two are enough to alternate between; a third would only be
+                // the compositor hanging on to both, and it can have this one.
+                if panel.canvases.len() >= 2 {
+                    panel.canvases.remove(0);
+                }
+                panel.canvases.push(Canvas { buffer, painted: Vec::new() });
+                panel.canvases.len() - 1
+            }
+        };
+
+        // What this buffer has in it from the frame it was last used for; all
+        // of it has to go, since the sheep have moved on since.
+        let stale = std::mem::take(&mut panel.canvases[slot].painted);
+        let Some(canvas) = panel.canvases[slot].buffer.canvas(&mut panel.pool) else { return };
+
+        if full {
+            // Fully transparent everywhere except the sheep.
+            canvas.fill(0);
+        } else {
+            for [x, y, w, h] in stale.iter().copied() {
+                for row in y..y + h {
+                    let i = ((row * bw + x) * 4) as usize;
+                    canvas[i..i + (w * 4) as usize].fill(0);
+                }
+            }
+        }
 
         let tile = self.tile.round() as i32;
         let region = Region::new(&self.compositor).ok();
+        // Where the sheep end up this time, to be damaged now and cleared next
+        // time round.
+        let mut painted: Vec<[i32; 4]> = Vec::new();
 
         for pen in &self.flock {
             let s = &pen.sheep;
@@ -542,6 +606,13 @@ impl Overlay {
             // the output scale.
             let dev = tile * scale;
             let src = self.src_w.round().max(1.0) as u32;
+
+            // The box it occupies in the buffer, clipped to it.
+            let (x0, y0) = (ox.clamp(0, bw), oy.clamp(0, bh));
+            let (x1, y1) = ((ox + dev).clamp(0, bw), (oy + dev).clamp(0, bh));
+            if x1 > x0 && y1 > y0 {
+                painted.push([x0, y0, x1 - x0, y1 - y0]);
+            }
 
             // Nearest-neighbour throughout - both the user's scale and the
             // output's - keeps the pixel art crisp rather than blurred.
@@ -585,9 +656,19 @@ impl Overlay {
             surface.set_input_region(Some(r.wl_region()));
         }
         surface.set_buffer_scale(scale);
-        surface.damage_buffer(0, 0, bw, bh);
+        if full {
+            surface.damage_buffer(0, 0, bw, bh);
+        } else {
+            // Everywhere a sheep has arrived, and everywhere one has left.
+            for [x, y, w, h] in painted.iter().chain(stale.iter()).copied() {
+                surface.damage_buffer(x, y, w, h);
+            }
+        }
         surface.frame(qh, FrameCallbackData(surface.clone()));
-        if let Err(e) = buffer.attach_to(surface) {
+        // Recorded before the attach can fail: what matters is that the next
+        // frame to use this buffer knows what is in it, committed or not.
+        panel.canvases[slot].painted = painted;
+        if let Err(e) = panel.canvases[slot].buffer.attach_to(surface) {
             eprintln!("hyprsheep: buffer attach failed: {e}");
             return;
         }
