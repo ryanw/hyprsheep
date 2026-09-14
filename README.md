@@ -92,6 +92,11 @@ Only the last tenth of a second of the drag counts, so a drag that comes to
 rest before you let go is still a drop. `throw = false` restores the original
 behaviour.
 
+`speed` is the one setting a throw ignores. Everything else the sheep does is
+its own idea and can be hurried along; a throw is the mouse's own velocity
+carried on, so it flies at the speed it was thrown at whatever pace the sheep
+is living at.
+
 With `climb_windows = true` a window is a solid block rather than just a ledge:
 the sheep bumps into its left and right faces and can climb them the way it
 climbs a screen edge, topping out onto the window's upper edge. Off, which is

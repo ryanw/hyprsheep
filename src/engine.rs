@@ -199,7 +199,11 @@ const TURN_AT_FACE: f64 = 0.2;
 /// While being dragged the original ignores physics and ticks at a fixed rate.
 const DRAG_INTERVAL: Duration = Duration::from_millis(50);
 /// How often a thrown sheep is moved along its arc. The pet file's own steps
-/// are far too coarse for one, so a throw runs on its own clock.
+/// are far too coarse for one, so a throw runs on its own clock - and unlike
+/// every other animation, `speed` does not touch it. A throw is the one thing
+/// the sheep does not choose to do: it is the mouse's velocity carried on, and
+/// watching a hurried sheep cross the screen faster than it was flung looks
+/// wrong in a way that a hurried walk does not.
 const TOSS_INTERVAL: Duration = Duration::from_millis(25);
 /// Downward acceleration of a thrown sheep, in logical pixels per second
 /// squared. Scaled with the sheep, like every other motion in here, so a big
@@ -524,7 +528,7 @@ impl Sheep {
             if let Some(id) = self.resolve(pet, world, tile, &anim, vx, vy, events) {
                 self.enter(pet, world, tile, id, events);
             }
-            return self.wait(TOSS_INTERVAL.as_millis() as f64);
+            return TOSS_INTERVAL;
         }
 
         let ctx = self.ctx(world, pet, tile);
@@ -1750,6 +1754,31 @@ mod tests {
         assert!(s.x > start.0 + 100.0, "the sheep was not carried to the right");
         // It ends on the floor, in whatever the pet file says landing is.
         assert!(s.y >= w.screens[0].floor() - TILE - 2.0, "it did not come down, y {}", s.y);
+    }
+
+    #[test]
+    fn speed_leaves_a_throw_alone() {
+        let p = pet();
+        let w = world();
+        let arc = |speed: f64| {
+            let mut s = Sheep::new(false);
+            let mut ev = Vec::new();
+            s.speed = speed;
+            s.begin(&p, &w, TILE, 1, &mut ev);
+            s.x = 300.0;
+            s.y = 400.0;
+            s.grab(&p, &w, TILE);
+            s.release(&p, &w, TILE, 900.0, -300.0, &mut ev);
+            let mut flight = Duration::ZERO;
+            while s.toss.is_some() && flight < Duration::from_secs(10) {
+                flight += s.step(&p, &w, TILE, &mut ev);
+            }
+            (s.x, s.y, flight)
+        };
+        // Same arc, and the same time taken over it, however fast the sheep
+        // is otherwise living.
+        assert_eq!(arc(1.0), arc(4.0));
+        assert_eq!(arc(1.0), arc(0.25));
     }
 
     #[test]
