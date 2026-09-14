@@ -53,6 +53,10 @@ pub struct Monitor {
     /// Space claimed by bars: left, top, right, bottom.
     pub reserved: (f64, f64, f64, f64),
     pub active_workspace: i64,
+    /// Whether something is fullscreen on this monitor's visible workspace.
+    /// Not read from `j/monitors`, which does not say: filled in from the
+    /// client list by `snapshot`.
+    pub fullscreen: bool,
 }
 
 impl Monitor {
@@ -122,6 +126,7 @@ fn monitors_from(list: &[Value]) -> Vec<Monitor> {
                     .and_then(|w| w.get("id"))
                     .and_then(Value::as_i64)
                     .unwrap_or(-1),
+                fullscreen: false,
             }
         })
         .collect()
@@ -131,24 +136,13 @@ fn monitors_from(list: &[Value]) -> Vec<Monitor> {
 ///
 /// Hyprland reports window positions in the same global logical space it lays
 /// monitors out in, so no translation is needed.
-pub fn snapshot(monitors: &[Monitor]) -> Result<World, String> {
+pub fn snapshot(monitors: &mut [Monitor]) -> Result<World, String> {
     let v = query("j/clients")?;
     let list = v.as_array().ok_or("clients: expected an array")?;
 
     let mut windows: Vec<Rect> = list
         .iter()
-        .filter(|c| {
-            // Only windows actually on screen are walkable: mapped, not
-            // hidden, and on the workspace their monitor is showing.
-            if !c.get("mapped").and_then(Value::as_bool).unwrap_or(false)
-                || c.get("hidden").and_then(Value::as_bool).unwrap_or(false)
-            {
-                return false;
-            }
-            let Some(mid) = c.get("monitor").and_then(Value::as_i64) else { return false };
-            let ws = c.get("workspace").and_then(|w| w.get("id")).and_then(Value::as_i64);
-            monitors.iter().any(|m| m.id == mid && Some(m.active_workspace) == ws)
-        })
+        .filter(|c| monitors.iter().any(|m| visible_on(c, m)))
         .filter_map(|c| {
             let w = at(c, "size", 0);
             let h = at(c, "size", 1);
@@ -170,6 +164,8 @@ pub fn snapshot(monitors: &[Monitor]) -> Result<World, String> {
     // topmost edge rather than one buried behind it.
     windows.sort_by(|a, b| a.y.total_cmp(&b.y));
 
+    mark_fullscreen(list, monitors);
+
     Ok(World {
         screens: monitors.iter().map(Monitor::screen).collect(),
         windows,
@@ -177,10 +173,49 @@ pub fn snapshot(monitors: &[Monitor]) -> Result<World, String> {
     })
 }
 
+/// Whether a client is on screen on this monitor right now: mapped, not
+/// hidden, and on the workspace the monitor is showing.
+fn visible_on(c: &Value, m: &Monitor) -> bool {
+    if !c.get("mapped").and_then(Value::as_bool).unwrap_or(false)
+        || c.get("hidden").and_then(Value::as_bool).unwrap_or(false)
+    {
+        return false;
+    }
+    let ws = c.get("workspace").and_then(|w| w.get("id")).and_then(Value::as_i64);
+    c.get("monitor").and_then(Value::as_i64) == Some(m.id) && Some(m.active_workspace) == ws
+}
+
+/// Note on each monitor whether a fullscreen window is covering it.
+fn mark_fullscreen(clients: &[Value], monitors: &mut [Monitor]) {
+    for m in monitors.iter_mut() {
+        m.fullscreen = clients.iter().any(|c| visible_on(c, m) && is_fullscreen(c));
+    }
+}
+
+/// Whether a client is genuinely fullscreen, rather than merely maximised.
+///
+/// Hyprland has reported this two ways. Older versions send `fullscreen` as a
+/// boolean, with the kind of it in `fullscreenMode`: 0 fullscreen, 1 maximised.
+/// Newer ones fold the two together into `fullscreen` as a number, where 2 is
+/// fullscreen and 1 maximised. Both shapes are read, since the sheep should not
+/// need a particular Hyprland to know when to get out of the way.
+///
+/// A maximised window does not count. It leaves the bars showing and is a
+/// window like any other - the sheep is welcome to walk along the top of it.
+fn is_fullscreen(c: &Value) -> bool {
+    match c.get("fullscreen") {
+        Some(Value::Bool(b)) => {
+            *b && c.get("fullscreenMode").and_then(Value::as_i64).unwrap_or(0) == 0
+        }
+        Some(v) => v.as_i64().unwrap_or(0) == 2,
+        None => false,
+    }
+}
+
 /// The current monitor layout and the world it implies.
 pub fn world() -> Result<(Vec<Monitor>, World), String> {
-    let m = monitors()?;
-    let w = snapshot(&m)?;
+    let mut m = monitors()?;
+    let w = snapshot(&mut m)?;
     Ok((m, w))
 }
 
@@ -252,6 +287,65 @@ mod tests {
             ));
             assert_eq!((m.width, m.height), (2560.0, 1440.0), "transform {transform}");
         }
+    }
+
+    fn monitor(id: i64, workspace: i64) -> Monitor {
+        parse(&format!(
+            r#"{{ "id": {id}, "name": "DP-1", "width": 1920, "height": 1080,
+                  "scale": 1.0, "transform": 0,
+                  "activeWorkspace": {{ "id": {workspace} }} }}"#
+        ))
+    }
+
+    fn client(json: &str) -> Value {
+        serde_json::from_str(json).unwrap()
+    }
+
+    /// The two shapes Hyprland has reported fullscreen in, and the maximised
+    /// case in each, which is a window like any other and not worth hiding for.
+    #[test]
+    fn both_spellings_of_fullscreen_are_understood() {
+        assert!(is_fullscreen(&client(r#"{ "fullscreen": 2 }"#)));
+        assert!(!is_fullscreen(&client(r#"{ "fullscreen": 1 }"#)));
+        assert!(!is_fullscreen(&client(r#"{ "fullscreen": 0 }"#)));
+
+        assert!(is_fullscreen(&client(
+            r#"{ "fullscreen": true, "fullscreenMode": 0 }"#
+        )));
+        assert!(!is_fullscreen(&client(
+            r#"{ "fullscreen": true, "fullscreenMode": 1 }"#
+        )));
+        assert!(!is_fullscreen(&client(r#"{ "fullscreen": false }"#)));
+
+        // A client list from something that never mentions it at all.
+        assert!(!is_fullscreen(&client(r#"{ "title": "term" }"#)));
+    }
+
+    /// Only the monitor actually showing the fullscreen window is covered: the
+    /// sheep carries on in plain sight on the other screen.
+    #[test]
+    fn fullscreen_covers_only_its_own_monitor() {
+        let mut monitors = vec![monitor(0, 1), monitor(1, 2)];
+        let clients = [client(
+            r#"{ "mapped": true, "hidden": false, "monitor": 0,
+                 "workspace": { "id": 1 }, "fullscreen": 2 }"#,
+        )];
+        mark_fullscreen(&clients, &mut monitors);
+        assert!(monitors[0].fullscreen);
+        assert!(!monitors[1].fullscreen);
+    }
+
+    /// A game left fullscreen on a workspace you have switched away from is
+    /// not covering anything, so the sheep comes back out.
+    #[test]
+    fn fullscreen_on_a_hidden_workspace_does_not_cover() {
+        let mut monitors = vec![monitor(0, 9)];
+        let clients = [client(
+            r#"{ "mapped": true, "hidden": false, "monitor": 0,
+                 "workspace": { "id": 1 }, "fullscreen": 2 }"#,
+        )];
+        mark_fullscreen(&clients, &mut monitors);
+        assert!(!monitors[0].fullscreen);
     }
 
     #[test]

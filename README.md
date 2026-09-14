@@ -47,6 +47,7 @@ draggable = true   # whether the sheep can be picked up with the mouse
 throw     = true   # whether letting go of a moving sheep throws it
 trace     = false  # log every animation change and where the sheep is
 climb_windows = false  # whether window sides are solid and climbable
+hide_fullscreen = true # whether to keep off a screen showing a fullscreen window
 # pet     = "~/pets/green_sheep.xml"
 ```
 
@@ -104,6 +105,18 @@ climbs a screen edge, topping out onto the window's upper edge. Off, which is
 the default and what the reference does, only the top edge exists and the sheep
 walks straight through the sides.
 
+With `hide_fullscreen = true`, which is the default, a monitor showing a
+fullscreen window loses its sheep: the overlay is unmapped, so there is nothing
+drawn over your game or your film and nothing for a click to catch on either.
+Only true fullscreen counts - a maximised window still has bars around it and a
+top edge to walk along, so the sheep stays. The sheep does not stop; it carries
+on walking and napping behind the fullscreen window, and is wherever it has got
+to when you come back out.
+
+A monitor is judged by what is on the workspace it is currently showing, so a
+game left fullscreen on a workspace you have switched away from gives the sheep
+back its screen.
+
 `pet` loads an alternative pet in the same XML format, sprite sheet and all -
 these files are self-contained. The green sheep that ships with web-esheep
 works, for instance, and brings 186 animations with it.
@@ -131,7 +144,8 @@ the window. Screen edges and the floor still stop them, being the borders the
 file was written against.
 
 Window geometry comes from Hyprland's IPC. `.socket.sock` answers `j/clients`
-and `j/monitors`; `.socket2.sock` streams an event per compositor change,
+and `j/monitors`, the client list also saying which monitors are showing
+something fullscreen; `.socket2.sock` streams an event per compositor change,
 which is used only as a hint to re-read the layout.
 
 The sheep live in one global coordinate space spanning every monitor, so a

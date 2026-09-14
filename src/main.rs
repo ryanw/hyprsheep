@@ -36,6 +36,8 @@ usage: hyprsheep [options]
   --no-throw            the same as --throw=false
   --climb-windows[=BOOL]  whether window sides are solid and climbable
   --no-climb-windows    the same as --climb-windows=false
+  --hide-fullscreen[=BOOL]  whether to hide on a screen showing fullscreen
+  --no-hide-fullscreen  the same as --hide-fullscreen=false
   --pet PATH            an alternative pet file in the eSheep XML format
   --trace[=BOOL]        log every animation change and where the sheep is
   --no-trace            the same as --trace=false

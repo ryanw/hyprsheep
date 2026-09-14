@@ -47,6 +47,9 @@ pub struct Config {
     /// Whether window sides are solid. Off, windows are ledges only; on, the
     /// sheep bumps into their sides and can climb them.
     pub climb_windows: bool,
+    /// Whether to take the sheep off a monitor showing a fullscreen window.
+    /// The sheep carries on living there unseen; it is only not drawn.
+    pub hide_fullscreen: bool,
     /// An alternative pet file in the same XML format. The sprite sheet is
     /// taken from the file itself.
     pub pet: Option<PathBuf>,
@@ -65,6 +68,7 @@ impl Default for Config {
             draggable: true,
             throw: true,
             climb_windows: true,
+            hide_fullscreen: true,
             pet: None,
             trace: false,
         }
@@ -139,6 +143,7 @@ impl Config {
                 ("draggable", Value::Bool(b)) => cfg.draggable = *b,
                 ("throw", Value::Bool(b)) => cfg.throw = *b,
                 ("climb_windows", Value::Bool(b)) => cfg.climb_windows = *b,
+                ("hide_fullscreen", Value::Bool(b)) => cfg.hide_fullscreen = *b,
                 ("monitors", Value::Str(s)) if s == "all" => cfg.monitors = Monitors::All,
                 ("monitors", Value::List(l)) => cfg.monitors = Monitors::Only(l.clone()),
                 ("monitors", Value::Str(s)) => cfg.monitors = Monitors::Only(vec![s.clone()]),
@@ -225,6 +230,8 @@ impl Config {
                 "--no-throw" => self.throw = false,
                 "--climb-windows" => self.climb_windows = flag(inline.as_deref(), &key)?,
                 "--no-climb-windows" => self.climb_windows = false,
+                "--hide-fullscreen" => self.hide_fullscreen = flag(inline.as_deref(), &key)?,
+                "--no-hide-fullscreen" => self.hide_fullscreen = false,
                 "--trace" => self.trace = flag(inline.as_deref(), &key)?,
                 "--no-trace" => self.trace = false,
                 other => return Err(format!("unknown option `{other}`")),

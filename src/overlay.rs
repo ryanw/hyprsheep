@@ -94,6 +94,17 @@ struct Panel {
     frame_pending: bool,
     /// Whether what is on screen is known to be out of date.
     needs_draw: bool,
+    /// Whether a fullscreen window is covering this output, in which case the
+    /// surface is unmapped: no sheep drawn, and nothing for the pointer to
+    /// catch on. The sheep themselves carry on as usual behind it.
+    covered: bool,
+    /// Whether the surface is currently unmapped, so that the hiding and the
+    /// remapping each happen once rather than every frame.
+    hidden: bool,
+    /// Whether the empty commit that asks to be mapped again has been sent and
+    /// the configure answering it is still to come. Until it does there is
+    /// nothing a buffer can be attached to.
+    remapping: bool,
     /// Buffers to paint into, used in turn. See `Canvas`.
     canvases: Vec<Canvas>,
     /// The device-pixel size the canvases were made at; they are thrown away
@@ -333,6 +344,9 @@ impl Overlay {
             origin,
             frame_pending: false,
             needs_draw: true,
+            covered: false,
+            hidden: false,
+            remapping: false,
             canvases: Vec::new(),
             canvas_size: (0, 0),
         });
@@ -395,6 +409,11 @@ impl Overlay {
                     if let Some(m) = self.monitors.iter().find(|m| m.name == panel.name) {
                         if panel.origin != (m.x, m.y) {
                             panel.origin = (m.x, m.y);
+                            panel.needs_draw = true;
+                        }
+                        let covered = self.cfg.hide_fullscreen && m.fullscreen;
+                        if panel.covered != covered {
+                            panel.covered = covered;
                             panel.needs_draw = true;
                         }
                     }
@@ -615,6 +634,21 @@ impl Overlay {
         // Either this draw brings the panel up to date or it cannot be drawn
         // at all yet, in which case a configure will ask again.
         panel.needs_draw = false;
+        if panel.covered {
+            Self::unmap(panel, &self.compositor);
+            return;
+        }
+        // Coming back out from behind a fullscreen window. An unmapped layer
+        // surface has to be mapped again from the beginning - an empty commit,
+        // and the configure the compositor answers it with - before a buffer
+        // attached to it means anything. So ask, and draw when it replies.
+        if panel.hidden {
+            if !panel.remapping {
+                panel.remapping = true;
+                panel.layer.commit();
+            }
+            return;
+        }
         if panel.width == 0 || panel.height == 0 {
             return;
         }
@@ -839,6 +873,28 @@ impl Overlay {
         panel.frame_pending = true;
     }
 
+    /// Take a panel off the screen entirely: no buffer, and no input region
+    /// either, so a fullscreen window is neither drawn on nor clicked through
+    /// to an invisible sheep. Its buffers go with it, so coming back is a full
+    /// repaint of whatever the sheep have got up to meanwhile.
+    fn unmap(panel: &mut Panel, compositor: &CompositorState) {
+        if panel.hidden {
+            return;
+        }
+        panel.hidden = true;
+        panel.remapping = false;
+        // Nothing will be drawn, so no frame callback is coming; waiting on
+        // one would leave the panel unable to draw itself again.
+        panel.frame_pending = false;
+        panel.canvases.clear();
+        let surface = panel.layer.wl_surface();
+        if let Ok(empty) = Region::new(compositor) {
+            surface.set_input_region(Some(empty.wl_region()));
+        }
+        surface.attach(None, 0, 0);
+        panel.layer.commit();
+    }
+
     fn panel_of(&self, surface: &wl_surface::WlSurface) -> Option<usize> {
         self.panels.iter().position(|p| p.layer.wl_surface() == surface)
     }
@@ -924,6 +980,10 @@ impl LayerShellHandler for Overlay {
             self.panels[i].width = w;
             self.panels[i].height = h;
         }
+        // The configure a hidden panel was waiting for: it is mapped again,
+        // and the draw below is what puts the sheep back on it.
+        self.panels[i].hidden = false;
+        self.panels[i].remapping = false;
         self.panels[i].needs_draw = true;
         if !self.panels[i].frame_pending {
             self.draw(qh, i);
