@@ -388,7 +388,7 @@ impl Overlay {
                     self.last_change = Instant::now();
                 }
                 self.monitors = monitors;
-                self.world = world;
+                self.world = World { flock: std::mem::take(&mut self.world.flock), ..world };
                 // A monitor may have been moved or rescaled underneath us.
                 for panel in &mut self.panels {
                     if let Some(m) = self.monitors.iter().find(|m| m.name == panel.name) {
@@ -465,6 +465,9 @@ impl Overlay {
 
     fn tick(&mut self) {
         self.refresh_world();
+        // Each sheep collides with where the others are now, which the world
+        // query knows nothing about: they are ours, not the compositor's.
+        self.world.flock = self.flock.iter().map(|p| p.sheep.bounds(self.tile)).collect();
 
         let now = Instant::now();
         let mut events = Vec::new();

@@ -5,7 +5,8 @@ A desktop sheep for Hyprland, after the 1995 Windows toy [eSheep][esheep].
 The sheep wanders around your screen, walks along the top edges of your
 windows, climbs the sides, falls when the window it was standing on closes,
 and occasionally stops for a nap. You can pick it up with the mouse, and
-throw it.
+throw it. Keep a few and they notice each other: a sheep that walks into
+another usually turns round, though now and then one wanders on past.
 
 ![Screenshot of hyprsheep](assets/screenshot.png)
 

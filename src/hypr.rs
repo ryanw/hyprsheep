@@ -170,7 +170,11 @@ pub fn snapshot(monitors: &[Monitor]) -> Result<World, String> {
     // topmost edge rather than one buried behind it.
     windows.sort_by(|a, b| a.y.total_cmp(&b.y));
 
-    Ok(World { screens: monitors.iter().map(Monitor::screen).collect(), windows })
+    Ok(World {
+        screens: monitors.iter().map(Monitor::screen).collect(),
+        windows,
+        flock: Vec::new(),
+    })
 }
 
 /// The current monitor layout and the world it implies.

@@ -4,6 +4,7 @@
 //! physics simulation - `<start>`/`<end>` carry per-step velocities that ramp
 //! across the sequence, so e.g. falling accelerates because the XML says so.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::anim::{Action, Animation, Only, Pet, Situation};
@@ -72,6 +73,10 @@ pub struct World {
     pub screens: Vec<Screen>,
     /// Walkable window edges, highest first.
     pub windows: Vec<Rect>,
+    /// Where the sheep are, one square each, including whichever sheep is
+    /// being stepped: a sheep picks itself out of the list by id. The host
+    /// refreshes it every frame, so it is as current as the drawing is.
+    pub flock: Vec<Rect>,
 }
 
 impl World {
@@ -136,6 +141,9 @@ impl Pose {
 }
 
 pub struct Sheep {
+    /// Tells this sheep apart from the rest of the flock, so that it can
+    /// leave itself out of the crowd it walks into.
+    pub id: u64,
     /// Position of the sprite's top-left corner, in logical pixels.
     pub x: f64,
     pub y: f64,
@@ -179,6 +187,9 @@ pub struct Sheep {
     /// walking through. Held until it is clear of that window, so the choice
     /// is made once per encounter rather than re-rolled every step.
     passing: Option<u64>,
+    /// A sheep this one has decided to walk on past rather than turn at. Held
+    /// until the two are clear of each other, for the same reason.
+    passing_sheep: Option<u64>,
     situation: Situation,
     /// Cached step count for the current animation.
     steps: u32,
@@ -196,6 +207,14 @@ const SIDE_REACH: f64 = 20.0;
 /// The rest of the time it is walked through, as it would be with the sides
 /// left open. Screen edges are unaffected: those are always walls.
 const TURN_AT_FACE: f64 = 0.2;
+/// How often meeting another sheep turns this one back. The rest of the time
+/// it walks on past: a sheep is not a wall to another sheep, and a flock that
+/// always turned would never mingle.
+const TURN_AT_SHEEP: f64 = 0.75;
+/// How far apart two sheep may be vertically and still be in each other's way,
+/// as a fraction of the sprite. Further apart, one is on a ledge above or
+/// below the other rather than in front of it.
+const MEET_REACH: f64 = 0.5;
 /// While being dragged the original ignores physics and ticks at a fixed rate.
 const DRAG_INTERVAL: Duration = Duration::from_millis(50);
 /// How often a thrown sheep is moved along its arc. The pet file's own steps
@@ -219,9 +238,16 @@ const TOSS_MIN: f64 = 250.0;
 /// The fastest a sheep can be thrown, however hard the flick.
 const TOSS_MAX: f64 = 2600.0;
 
+/// Hand out the next sheep's identity. Only uniqueness matters.
+fn next_id() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 impl Sheep {
     pub fn new(is_child: bool) -> Self {
         Sheep {
+            id: next_id(),
             x: 0.0,
             y: 0.0,
             animation: 1,
@@ -240,6 +266,7 @@ impl Sheep {
             toss: None,
             resting_on: None,
             passing: None,
+            passing_sheep: None,
             situation: Situation::default(),
             steps: 1,
         }
@@ -461,6 +488,46 @@ impl Sheep {
         }
     }
 
+    /// The square this sheep takes up, as the rest of the flock sees it.
+    pub fn bounds(&self, tile: f64) -> Rect {
+        Rect { id: self.id, x: self.x, y: self.y, w: tile, h: tile }
+    }
+
+    /// Are the two sheep at the same height - near enough to be face to face
+    /// rather than one of them standing on a ledge over the other?
+    fn level_with(&self, r: &Rect, tile: f64) -> bool {
+        (self.y - r.top()).abs() < tile * MEET_REACH
+    }
+
+    /// Walking into another sheep: that sheep, and the x this one is held at,
+    /// nose to nose with it. `dir` is the direction of travel.
+    ///
+    /// Read the same way as [`window_side`](Self::window_side): only a sheep
+    /// just walked into is in the way, so two that start out overlapping -
+    /// spawned together, or dropped on one another - walk apart rather than
+    /// being shoved aside, and one already being walked past stays passable.
+    fn sheep_face(&self, world: &World, tile: f64, dir: f64) -> Option<(u64, f64)> {
+        let faces = world
+            .flock
+            .iter()
+            .filter(|r| r.id != self.id && Some(r.id) != self.passing_sheep)
+            .filter(|r| self.level_with(r, tile))
+            .filter_map(|r| {
+                let (edge, past) = if dir < 0.0 {
+                    (r.right(), r.right() - self.x)
+                } else {
+                    (r.left() - tile, self.x + tile - r.left())
+                };
+                (past > 0.0 && past <= SIDE_REACH * self.scale).then_some((r.id, edge))
+            });
+        // Whichever of them it ran into first, if it is in a crowd.
+        match dir {
+            d if d < 0.0 => faces.max_by(|a, b| a.1.total_cmp(&b.1)),
+            d if d > 0.0 => faces.min_by(|a, b| a.1.total_cmp(&b.1)),
+            _ => None,
+        }
+    }
+
     /// Is the sheep pressed against a window's face, having been stopped by it?
     fn on_window_side(&self, world: &World, tile: f64) -> bool {
         world.windows.iter().any(|r| {
@@ -662,6 +729,20 @@ impl Sheep {
         // at all. The pet's own table decides whether this is a climb; if it
         // is not, the side turns the sheep back only now and then, and is
         // otherwise walked through as it would be with the sides left open.
+        // A sheep that was walked past is in the way again once the two have
+        // come apart - or once it is gone from the flock altogether.
+        if let Some(id) = self.passing_sheep {
+            let touching = world.flock.iter().any(|r| {
+                r.id == id
+                    && self.level_with(r, tile)
+                    && self.x + tile > r.left()
+                    && self.x < r.right()
+            });
+            if !touching {
+                self.passing_sheep = None;
+            }
+        }
+
         let mut face_stop = None;
         let mut face_next = None;
         if let Some((id, edge)) = self.window_side(world, tile, x2).filter(|_| !anim.border.is_empty())
@@ -676,6 +757,25 @@ impl Sheep {
             } else {
                 self.x = stood_at;
                 self.passing = Some(id);
+            }
+        }
+
+        // Another sheep in the way is a softer thing than a window: there is
+        // nothing to climb and no ledge to peer over, so the reaction is
+        // whatever the pet file does on running into something flat - for a
+        // walking sheep, turning round. A sheep in flight is not meeting
+        // anyone; it is passing through.
+        let mut met_at = None;
+        let mut met_next = None;
+        if face_stop.is_none()
+            && self.toss.is_none()
+            && let Some((id, edge)) = self.sheep_face(world, tile, x2)
+        {
+            if fastrand::f64() < TURN_AT_SHEEP {
+                met_at = Some(edge);
+                met_next = pet.choose(&anim.border, Situation::default()).map(|n| n.target);
+            } else {
+                self.passing_sheep = Some(id);
             }
         }
 
@@ -695,6 +795,10 @@ impl Sheep {
             self.x = x;
             hit_border = true;
             self.situation.on_vertical = true;
+        } else if let Some(x) = met_at {
+            // Nose to nose with another sheep.
+            self.x = x;
+            hit_border = true;
         } else if y2 < 0.0 && self.y < screen.y && !continues(mid_x, self.y - 1.0) {
             self.y = screen.y;
             hit_border = true;
@@ -770,7 +874,7 @@ impl Sheep {
             // A face has already drawn from the same table; rolling again here
             // could contradict the choice that held the sheep in the first
             // place.
-            if let Some(target) = face_next {
+            if let Some(target) = face_next.or(met_next) {
                 return Some(target);
             }
             if let Some(n) = pet.choose(&anim.border, self.situation) {
@@ -839,7 +943,7 @@ mod tests {
     }
 
     fn world() -> World {
-        World { screens: vec![screen(0, 0.0, 1920.0, 1080.0)], windows: vec![] }
+        World { screens: vec![screen(0, 0.0, 1920.0, 1080.0)], windows: vec![], flock: vec![] }
     }
 
     /// Two monitors side by side, the second narrower.
@@ -847,6 +951,7 @@ mod tests {
         World {
             screens: vec![screen(0, 0.0, 1920.0, 1080.0), screen(1, 1920.0, 960.0, 1080.0)],
             windows: vec![],
+            flock: vec![],
         }
     }
 
@@ -1394,6 +1499,133 @@ mod tests {
         }
     }
 
+    /// A sheep standing still on the floor at `x`, for another to walk into.
+    fn world_with_a_sheep_at(x: f64, y: f64) -> World {
+        let mut w = world();
+        w.flock.push(Rect { id: 77, x, y, w: TILE, h: TILE });
+        w
+    }
+
+    /// Walk left off `from` for 200 steps and report the furthest it reached.
+    fn approach(p: &Pet, w: &World, from: f64) -> f64 {
+        let mut s = Sheep::new(false);
+        let mut ev = Vec::new();
+        s.x = from;
+        s.y = 1040.0;
+        s.begin(p, w, TILE, 1, &mut ev);
+        let mut furthest = s.x;
+        for _ in 0..200 {
+            s.step(p, w, TILE, &mut ev);
+            furthest = furthest.min(s.x);
+        }
+        furthest
+    }
+
+    #[test]
+    fn a_sheep_in_the_way_turns_another_back_most_of_the_time() {
+        let p = pet();
+        let w = world_with_a_sheep_at(900.0, 1040.0);
+
+        // Nose to nose is the far sheep's right edge, a tile short of it.
+        let (mut stopped, mut through) = (0, 0);
+        for _ in 0..80 {
+            if approach(&p, &w, 1010.0) >= 940.0 { stopped += 1 } else { through += 1 }
+        }
+        assert!(stopped > 0, "one sheep never noticed another at all");
+        assert!(through > 0, "one sheep never walked on past another");
+        assert!(stopped > through, "sheep walked past each other more often than not");
+    }
+
+    #[test]
+    fn a_sheep_a_ledge_higher_is_not_in_the_way() {
+        let p = pet();
+        // Standing a whole sprite higher: on something, not in front.
+        let w = world_with_a_sheep_at(900.0, 1000.0);
+        for _ in 0..30 {
+            assert!(
+                approach(&p, &w, 1010.0) < 940.0,
+                "a sheep on another level stopped one walking below it"
+            );
+        }
+    }
+
+    #[test]
+    fn a_sheep_does_not_walk_into_itself() {
+        let p = pet();
+        let mut s = Sheep::new(false);
+        let mut w = world();
+        // The sheep's own square, sitting in the flock where it is headed.
+        w.flock.push(Rect { id: s.id, x: 900.0, y: 1040.0, w: TILE, h: TILE });
+
+        let mut ev = Vec::new();
+        s.x = 1010.0;
+        s.y = 1040.0;
+        s.begin(&p, &w, TILE, 1, &mut ev);
+        let mut furthest = s.x;
+        for _ in 0..200 {
+            s.step(&p, &w, TILE, &mut ev);
+            furthest = furthest.min(s.x);
+        }
+        assert!(furthest < 940.0, "a sheep was stopped by itself");
+    }
+
+    #[test]
+    fn a_sheep_stopped_by_another_turns_round_and_walks_off() {
+        let p = pet();
+        let w = world_with_a_sheep_at(900.0, 1040.0);
+        // A meeting turns the sheep back most times but not every time, so
+        // approach until one of the approaches is the kind that stops.
+        for attempt in 0..100 {
+            let mut s = Sheep::new(false);
+            let mut ev = Vec::new();
+            s.x = 1010.0;
+            s.y = 1040.0;
+            s.begin(&p, &w, TILE, 1, &mut ev);
+
+            let mut met = false;
+            for _ in 0..60 {
+                s.step(&p, &w, TILE, &mut ev);
+                met |= s.x == 940.0;
+                if met && s.flipped {
+                    // Turned about, and on its way back the other side.
+                    assert!(s.x >= 940.0, "walked through the sheep it turned at");
+                    return;
+                }
+            }
+            assert!(attempt < 99, "never once ended up nose to nose");
+        }
+    }
+
+    /// The flock as the host keeps it: two live sheep, each seeing where the
+    /// other actually is, stepped together for a long while.
+    #[test]
+    fn two_sheep_sharing_a_floor_keep_moving() {
+        let p = pet();
+        let mut w = world();
+        let mut ev = Vec::new();
+        let mut flock = [Sheep::new(false), Sheep::new(false)];
+        for (s, x) in flock.iter_mut().zip([600.0, 900.0]) {
+            s.x = x;
+            s.y = 1040.0;
+            s.begin(&p, &w, TILE, 1, &mut ev);
+        }
+
+        let mut ground = [0.0f64, 0.0];
+        for _ in 0..4000 {
+            w.flock = flock.iter().map(|s| s.bounds(TILE)).collect();
+            for (s, covered) in flock.iter_mut().zip(ground.iter_mut()) {
+                let was = s.x;
+                s.step(&p, &w, TILE, &mut ev);
+                *covered += (s.x - was).abs();
+                assert!(s.x.is_finite() && s.y.is_finite(), "position went non-finite");
+            }
+            ev.retain(|e| *e != Event::Died);
+        }
+        for covered in ground {
+            assert!(covered > 1000.0, "a sheep spent the run pinned against the other");
+        }
+    }
+
     #[test]
     fn climbing_a_window_side_tops_out_on_its_ledge() {
         let p = pet();
@@ -1468,6 +1700,7 @@ mod tests {
         let w = World {
             screens: vec![screen(0, 0.0, 1920.0, 1080.0), screen(1, 1920.0, 960.0, 540.0)],
             windows: vec![],
+            flock: vec![],
         };
         let mut s = Sheep::new(false);
         let mut ev = Vec::new();
@@ -1529,6 +1762,7 @@ mod tests {
                 reserved: (0.0, 0.0, 0.0, 0.0),
             }],
             windows: vec![Rect { id: 9, x: 3858.0, y: -26.0, w: 1404.0, h: 1242.0 }],
+            flock: vec![],
         };
         let mut s = Sheep::new(false);
         let mut ev = Vec::new();
@@ -1549,6 +1783,7 @@ mod tests {
         let w = World {
             screens: vec![screen(0, 0.0, 1920.0, 1080.0), screen(1, 1920.0, 960.0, 540.0)],
             windows: vec![],
+            flock: vec![],
         };
         let mut tall = Sheep::new(false);
         tall.x = 100.0;
