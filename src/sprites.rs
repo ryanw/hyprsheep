@@ -46,13 +46,17 @@ impl Sheet {
         Ok(Sheet { width: info.width, height: info.height, pixels })
     }
 
-    /// Straight-alpha RGBA for one pixel of the sheet.
+    /// One row of the sheet, as straight-alpha RGBA.
+    ///
+    /// The blit walks a row at a time, so it pays for the bounds check once
+    /// per row rather than once per pixel. A row off the end of the sheet
+    /// comes back empty, which reads as transparent.
     #[inline]
-    pub fn pixel(&self, x: u32, y: u32) -> [u8; 4] {
-        if x >= self.width || y >= self.height {
-            return [0, 0, 0, 0];
+    pub fn row(&self, y: u32) -> &[u8] {
+        if y >= self.height {
+            return &[];
         }
-        let i = ((y * self.width + x) * 4) as usize;
-        [self.pixels[i], self.pixels[i + 1], self.pixels[i + 2], self.pixels[i + 3]]
+        let i = (y * self.width * 4) as usize;
+        &self.pixels[i..i + (self.width * 4) as usize]
     }
 }

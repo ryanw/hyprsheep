@@ -575,6 +575,36 @@ impl Overlay {
         // time round.
         let mut painted: Vec<[i32; 4]> = Vec::new();
 
+        // The sprite covers this many device pixels: its drawn size times the
+        // output scale. Nearest-neighbour throughout - both the user's scale
+        // and the output's - keeps the pixel art crisp rather than blurred,
+        // and which source pixel each one of them takes is the same for every
+        // sheep on this panel, so it is worked out once here rather than
+        // millions of times in the loop below.
+        let dev = tile * scale;
+        let src = self.src_w.round().max(1.0) as u32;
+        let map: Vec<u32> = (0..dev).map(|d| sample(d, dev, src)).collect();
+        // The same mapping the other way round: the run of device pixels each
+        // source pixel covers. Scaled up, one source pixel is several device
+        // pixels of the same colour, so the conversion is done once and the
+        // result repeated across the run rather than worked out per pixel.
+        let mut runs = vec![(0i32, 0i32); src as usize];
+        for (d, &sx) in map.iter().enumerate() {
+            let run = &mut runs[sx as usize];
+            if run.0 == run.1 {
+                *run = (d as i32, d as i32 + 1);
+            } else {
+                run.1 = d as i32 + 1;
+            }
+        }
+
+        // One row of a sprite, scaled and converted ready to be copied into
+        // the buffer, and the stretches of it that are worth copying. A row
+        // of the sheet covers several device rows, so it is built once and
+        // then handed to each of them.
+        let mut strip = vec![0u8; (dev * 4) as usize];
+        let mut spans: Vec<(i32, i32)> = Vec::new();
+
         for pen in &self.flock {
             let s = &pen.sheep;
             // Global position translated into this output's own space; a sheep
@@ -602,48 +632,75 @@ impl Overlay {
             let oy = ly.round() as i32 * scale;
             let alpha = s.opacity.clamp(0.0, 1.0);
 
-            // The sprite covers this many device pixels: its drawn size times
-            // the output scale.
-            let dev = tile * scale;
-            let src = self.src_w.round().max(1.0) as u32;
-
             // The box it occupies in the buffer, clipped to it.
             let (x0, y0) = (ox.clamp(0, bw), oy.clamp(0, bh));
             let (x1, y1) = ((ox + dev).clamp(0, bw), (oy + dev).clamp(0, bh));
-            if x1 > x0 && y1 > y0 {
-                painted.push([x0, y0, x1 - x0, y1 - y0]);
+            if x1 <= x0 || y1 <= y0 {
+                continue;
             }
 
-            // Nearest-neighbour throughout - both the user's scale and the
-            // output's - keeps the pixel art crisp rather than blurred.
-            for dy in 0..dev {
-                let py = oy + dy;
-                if py < 0 || py >= bh {
-                    continue;
+            painted.push([x0, y0, x1 - x0, y1 - y0]);
+
+            let opaque = alpha >= 1.0;
+            // Which row of the sheet the strip currently holds, so that the
+            // several device rows it covers cost one row of work between them.
+            let mut held = None;
+
+            for py in y0..y1 {
+                let sy = map[(py - oy) as usize];
+                if held != Some(sy) {
+                    held = Some(sy);
+                    let row = self.sheet.row(sy0 + sy);
+                    spans.clear();
+                    for d in 0..src as usize {
+                        let (rs, re) = runs[d];
+                        if rs == re {
+                            continue;
+                        }
+                        // Flipping mirrors the sprite horizontally; the engine
+                        // mirrors its velocity to match.
+                        let sx = if s.flipped { src - 1 - d as u32 } else { d as u32 };
+                        let j = ((sx0 + sx) * 4) as usize;
+                        let Some(p) = row.get(j..j + 4) else { continue };
+                        let (r, g, b, a) = (p[0], p[1], p[2], p[3]);
+                        if a == 0 {
+                            continue;
+                        }
+                        // wl_shm ARGB8888 expects premultiplied alpha, which
+                        // for the usual fully opaque pixel is no work at all.
+                        let argb = if opaque && a == 255 {
+                            [b, g, r, 255]
+                        } else {
+                            let a = (a as f64 * alpha) as u32;
+                            if a == 0 {
+                                continue;
+                            }
+                            let pm = |c: u8| ((c as u32 * a) / 255) as u8;
+                            [pm(b), pm(g), pm(r), a as u8]
+                        };
+                        let run = &mut strip[(rs * 4) as usize..(re * 4) as usize];
+                        for px in run.chunks_exact_mut(4) {
+                            px.copy_from_slice(&argb);
+                        }
+                        // Transparent pixels are never copied, so a sheep
+                        // behind this one still shows through the gaps.
+                        match spans.last_mut() {
+                            Some(last) if last.1 == rs => last.1 = re,
+                            _ => spans.push((rs, re)),
+                        }
+                    }
                 }
-                let sy = sample(dy, dev, src);
-                for dx in 0..dev {
-                    let px = ox + dx;
-                    if px < 0 || px >= bw {
+
+                for &(rs, re) in &spans {
+                    let from = (ox + rs).max(x0);
+                    let to = (ox + re).min(x1);
+                    if to <= from {
                         continue;
                     }
-                    let sx = sample(dx, dev, src);
-                    // Flipping mirrors the sprite horizontally; the engine
-                    // mirrors its velocity to match.
-                    let sx = if s.flipped { src - 1 - sx } else { sx };
-                    let [r, g, b, a] = self.sheet.pixel(sx0 + sx, sy0 + sy);
-                    if a == 0 {
-                        continue;
-                    }
-                    let a = (a as f64 * alpha) as u32;
-                    if a == 0 {
-                        continue;
-                    }
-                    // wl_shm ARGB8888 expects premultiplied alpha.
-                    let pm = |c: u8| ((c as u32 * a) / 255) as u8;
-                    let argb = u32::from_le_bytes([pm(b), pm(g), pm(r), a as u8]).to_le_bytes();
-                    let i = ((py * bw + px) * 4) as usize;
-                    canvas[i..i + 4].copy_from_slice(&argb);
+                    let i = ((py * bw + from) * 4) as usize;
+                    let j = ((from - ox) * 4) as usize;
+                    let n = ((to - from) * 4) as usize;
+                    canvas[i..i + n].copy_from_slice(&strip[j..j + n]);
                 }
             }
         }
