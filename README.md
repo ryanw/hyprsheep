@@ -5,8 +5,9 @@ A desktop sheep for Hyprland, after the 1995 Windows toy [eSheep][esheep].
 The sheep wanders around your screen, walks along the top edges of your
 windows, climbs the sides, falls when the window it was standing on closes,
 and occasionally stops for a nap. You can pick it up with the mouse, and
-throw it. Keep a few and they notice each other: a sheep that walks into
-another usually turns round, though now and then one wanders on past.
+throw it. Leave the mouse sitting still near one and it will come over to
+look. Keep a few and they notice each other: a sheep that walks into another
+usually turns round, though now and then one wanders on past.
 
 ![Screenshot of hyprsheep](assets/screenshot.png)
 
@@ -32,7 +33,7 @@ key, and the command line wins:
 
 ```sh
 hyprsheep --sheep 3 --scale 2 --speed 1.5 --monitors eDP-1,HDMI-A-1
-hyprsheep --smooth 0
+hyprsheep --smooth 0 --no-cursor
 hyprsheep --pet ~/pets/green_sheep.xml --trace
 ```
 
@@ -46,6 +47,7 @@ monitors  = "all"  # "all", one name, or ["eDP-1", "HDMI-A-1"]
 draggable = true   # whether the sheep can be picked up with the mouse
 throw     = true   # whether letting go of a moving sheep throws it
 trace     = false  # log every animation change and where the sheep is
+cursor    = true   # whether the sheep notice a mouse left sitting still
 climb_windows = false  # whether window sides are solid and climbable
 hide_fullscreen = true # whether to keep off a screen showing a fullscreen window
 # pet     = "~/pets/green_sheep.xml"
@@ -98,6 +100,36 @@ behaviour.
 its own idea and can be hurried along; a throw is the mouse's own velocity
 carried on, so it flies at the speed it was thrown at whatever pace the sheep
 is living at.
+
+With `cursor = true`, which is the default, a mouse pointer left sitting still
+is something in the sheep's world. One walking within a few hundred pixels of
+it turns round and comes over to look, stops nose to it rather than walking
+through, and then wanders off again. So the sheep can be herded: park the
+pointer where you want one and wait.
+
+Only a pointer that has *stopped* counts. One crossing the screen on its way
+to a window is ignored, or the flock would trail after every click like
+something being pushed around by an invisible hand. Half a second of stillness
+is enough, and the moment the mouse moves it stops being a thing again.
+
+A sheep that has had its look ignores that spot until the pointer moves: a
+mouse abandoned beside a sheep is not a sheep's whole life. Nor does the
+pointer disturb one that is not walking - asleep, eating, sitting down - or
+one busy climbing or falling, which has more pressing concerns than the mouse.
+Only a sheep travelling along the ground goes to look.
+
+The decision to turn is ours; the turn itself is not. It comes from the same
+`<border>` table the animation uses for a wall, which for a walking sheep is
+its own about-face, so it comes round the way it comes round at the edge of
+the screen rather than snapping the sprite over. An animation with no border
+table of its own is not stopped by the pointer at all, for the same reason
+windows do not stop it: a sheep in mid-dive has nothing in the file to do
+about a mouse.
+
+Knowing where the pointer is takes asking Hyprland - the overlay's own input
+region is narrowed to the sheep, so Wayland only reports a pointer already
+over one. That is a very small IPC query a few times a second while the sheep
+are awake, and `cursor = false` stops it being made at all.
 
 With `climb_windows = true` a window is a solid block rather than just a ledge:
 the sheep bumps into its left and right faces and can climb them the way it
@@ -177,6 +209,10 @@ by a test:
 `offsety` and `opacity` are also applied; the reference parses them and then
 never uses them. The abduction relies on it: the saucer fades in and the sheep
 fades out as it is carried off.
+
+Noticing the mouse is an addition too, and the second piece of the sheep's
+behaviour that is ours rather than the file's - the throw arc being the first.
+The pet format has nothing to say about a pointer except being dragged by one.
 
 One addition rather than a divergence. The sheet has always carried flying
 saucers and aliens that no animation in the eSheep pet file ever used - the

@@ -77,6 +77,14 @@ pub struct World {
     /// being stepped: a sheep picks itself out of the list by id. The host
     /// refreshes it every frame, so it is as current as the drawing is.
     pub flock: Vec<Rect>,
+    /// Where the mouse pointer is resting, if it is resting anywhere.
+    ///
+    /// A pointer in motion is on its way somewhere and is not in here: the
+    /// host puts it in the world only once it has held still, and takes it
+    /// out again the moment it moves. So the sheep react to a mouse left
+    /// alone beside them and not to one crossing the screen, which would look
+    /// like being pushed around by something invisible.
+    pub pointer: Option<(f64, f64)>,
 }
 
 impl World {
@@ -196,6 +204,11 @@ pub struct Sheep {
     /// A sheep this one has decided to walk on past rather than turn at. Held
     /// until the two are clear of each other, for the same reason.
     passing_sheep: Option<u64>,
+    /// A resting place of the pointer this sheep has already been over to
+    /// look at. It stops being interesting once looked at, so that a sheep
+    /// does not spend its life pacing around an abandoned mouse; move the
+    /// pointer and it is news again.
+    met_pointer: Option<(f64, f64)>,
     situation: Situation,
     /// Cached step count for the current animation.
     steps: u32,
@@ -217,6 +230,10 @@ const TURN_AT_FACE: f64 = 0.2;
 /// it walks on past: a sheep is not a wall to another sheep, and a flock that
 /// always turned would never mingle.
 const TURN_AT_SHEEP: f64 = 0.75;
+/// How far off a resting pointer can be and still be worth walking over to
+/// look at, in logical pixels. Scaled with the sheep, like every other
+/// distance in here.
+const POINTER_REACH: f64 = 250.0;
 /// How far apart two sheep may be vertically and still be in each other's way,
 /// as a fraction of the sprite. Further apart, one is on a ledge above or
 /// below the other rather than in front of it.
@@ -273,6 +290,7 @@ impl Sheep {
             resting_on: None,
             passing: None,
             passing_sheep: None,
+            met_pointer: None,
             situation: Situation::default(),
             steps: 1,
         }
@@ -565,6 +583,33 @@ impl Sheep {
         }
     }
 
+    /// The resting pointer this sheep still finds interesting, if any.
+    fn pointer(&self, world: &World) -> Option<(f64, f64)> {
+        world.pointer.filter(|p| self.met_pointer != Some(*p))
+    }
+
+    /// Is a point at the sheep's own height - in front of its face, rather
+    /// than over its head or below its feet?
+    fn level_at(&self, y: f64, tile: f64) -> bool {
+        y > self.y - tile * MEET_REACH && y < self.y + tile * (1.0 + MEET_REACH)
+    }
+
+    /// Walking into the resting pointer: the x the sheep is held at, nose to
+    /// it. `dir` is the direction of travel.
+    ///
+    /// Read like [`sheep_face`](Self::sheep_face): the pointer has to be
+    /// something the sheep has just walked into, so one that comes to rest on
+    /// top of a sheep is not in its way and it walks out from under it.
+    fn pointer_face(&self, world: &World, tile: f64, dir: f64) -> Option<f64> {
+        let (px, py) = self.pointer(world)?;
+        if !self.level_at(py, tile) {
+            return None;
+        }
+        let (edge, past) =
+            if dir < 0.0 { (px, px - self.x) } else { (px - tile, self.x + tile - px) };
+        (past > 0.0 && past <= SIDE_REACH * self.scale).then_some(edge)
+    }
+
     /// Is the sheep pressed against a window's face, having been stopped by it?
     fn on_window_side(&self, world: &World, tile: f64) -> bool {
         world.windows.iter().any(|r| {
@@ -816,6 +861,26 @@ impl Sheep {
             }
         }
 
+        // A pointer left still is a body in the world as well, and met the
+        // same way - windows' own caveat included, that an animation with no
+        // border table of its own is not asking to be stopped by anything, so
+        // a sheep mid-dive is not halted in mid-air by a mouse. Except that
+        // the pointer always stops the sheep. A sheep walking
+        // on past another is two animals mingling; a mouse parked in front of
+        // one is a person asking for its attention, and being ignored four
+        // times in five would read as the feature not working.
+        if face_stop.is_none()
+            && met_at.is_none()
+            && self.toss.is_none()
+            && !anim.border.is_empty()
+            && let Some(edge) = self.pointer_face(world, tile, x2)
+        {
+            met_at = Some(edge);
+            met_next = pet.choose(&anim.border, Situation::default()).map(|n| n.target);
+            // Looked at. Until the mouse moves again, walk through it.
+            self.met_pointer = world.pointer;
+        }
+
         if x2 < 0.0 && self.x < screen.x && !continues(self.x - 1.0, mid_y) {
             self.x = screen.x;
             hit_border = true;
@@ -947,7 +1012,61 @@ impl Sheep {
             }
         }
 
-        None
+        // 4. Curiosity: a pointer resting within reach that the sheep is
+        //    walking away from turns it round to come and look. Last, so that
+        //    a border or a fall this same step wins - what the mouse is doing
+        //    is never more urgent than the floor.
+        self.notice_pointer(pet, world, tile, anim, x2, y2)
+    }
+
+    /// Turn towards a resting pointer, if there is one worth turning for.
+    ///
+    /// This is ours rather than the file's: the pet format has nothing to say
+    /// about the mouse beyond being dragged by it. Only the decision to turn
+    /// is an addition, though - the turn itself is whatever the animation's
+    /// own border table does, which for a walking sheep is its about-face, so
+    /// it comes about the way it comes about at a wall rather than snapping
+    /// round on the spot.
+    fn notice_pointer(
+        &mut self,
+        pet: &Pet,
+        world: &World,
+        tile: f64,
+        anim: &Animation,
+        x2: f64,
+        y2: f64,
+    ) -> Option<u32> {
+        // Only a sheep travelling along the ground notices. Climbing and
+        // falling have a y of their own and are busy; sitting, sleeping and
+        // eating do not move and have nowhere to turn to. A companion's
+        // course is its parent's business, not the mouse's.
+        if self.is_child || self.toss.is_some() || self.dragging {
+            return None;
+        }
+        if x2 == 0.0 || y2 != 0.0 || anim.action == Action::Flip {
+            return None;
+        }
+        let (px, py) = self.pointer(world)?;
+        if !self.level_at(py, tile) {
+            return None;
+        }
+        let away = px - (self.x + tile / 2.0);
+        // Out of reach, or already close enough to be about to bump into it.
+        if away.abs() > POINTER_REACH * self.scale || away.abs() <= SIDE_REACH * self.scale {
+            return None;
+        }
+        // Already on its way there.
+        if away.signum() == x2.signum() {
+            return None;
+        }
+        match pet.choose(&anim.border, Situation::default()) {
+            Some(n) => Some(n.target),
+            None => {
+                // Nothing in the file to turn round with: mirror it in place.
+                self.flipped = !self.flipped;
+                None
+            }
+        }
     }
 
     fn update_situation(&mut self, world: &World, tile: f64, on_window: bool) {
@@ -980,7 +1099,12 @@ mod tests {
     }
 
     fn world() -> World {
-        World { screens: vec![screen(0, 0.0, 1920.0, 1080.0)], windows: vec![], flock: vec![] }
+        World {
+            screens: vec![screen(0, 0.0, 1920.0, 1080.0)],
+            windows: vec![],
+            flock: vec![],
+            pointer: None,
+        }
     }
 
     /// Two monitors side by side, the second narrower.
@@ -989,6 +1113,7 @@ mod tests {
             screens: vec![screen(0, 0.0, 1920.0, 1080.0), screen(1, 1920.0, 960.0, 1080.0)],
             windows: vec![],
             flock: vec![],
+            pointer: None,
         }
     }
 
@@ -1558,6 +1683,167 @@ mod tests {
         furthest
     }
 
+    /// A pointer resting at a point, for a sheep to notice.
+    fn world_with_the_pointer_at(x: f64, y: f64) -> World {
+        World { pointer: Some((x, y)), ..world() }
+    }
+
+    /// A sheep walking left into a resting pointer is stopped by it every
+    /// time, unlike another sheep, which it walks past one time in four.
+    #[test]
+    fn a_resting_pointer_always_stops_a_sheep_walking_into_it() {
+        let p = pet();
+        let w = world_with_the_pointer_at(900.0, 1040.0);
+        // Nose to it is the pointer's own x: the sheep's leading edge stops
+        // there. Only the first encounter is judged - once it has had its
+        // look the spot is open again, which is its own test below - and a
+        // run that never gets that far is one where the sheep chose to stop
+        // walking on the way, which is its own business.
+        let mut reached = 0;
+        for _ in 0..80 {
+            let mut s = Sheep::new(false);
+            let mut ev = Vec::new();
+            s.x = 1011.0;
+            s.y = 1040.0;
+            s.begin(&p, &w, TILE, 1, &mut ev);
+            for _ in 0..200 {
+                s.step(&p, &w, TILE, &mut ev);
+                if s.met_pointer.is_some() {
+                    reached += 1;
+                    break;
+                }
+                assert!(
+                    s.x >= 900.0,
+                    "a sheep walked through a pointer resting in front of it, to {}",
+                    s.x
+                );
+            }
+        }
+        assert!(reached > 0, "no sheep ever walked as far as the pointer");
+    }
+
+    /// The same test the flock gets: a thing a whole sprite higher up is
+    /// something the sheep is under, not something in front of its face.
+    #[test]
+    fn a_pointer_over_the_sheeps_head_is_not_in_the_way() {
+        let p = pet();
+        let w = world_with_the_pointer_at(900.0, 970.0);
+        for _ in 0..30 {
+            assert!(
+                approach(&p, &w, 1011.0) < 900.0,
+                "a pointer resting above the sheep stopped it walking below"
+            );
+        }
+    }
+
+    /// A pointer in motion is never in the world at all - the host puts it
+    /// there only once it has held still - so an empty pointer must leave the
+    /// walk untouched.
+    #[test]
+    fn a_pointer_the_host_is_not_offering_does_nothing() {
+        let p = pet();
+        let w = world();
+        for _ in 0..30 {
+            assert!(approach(&p, &w, 1011.0) < 900.0, "stopped by a pointer that is not there");
+        }
+    }
+
+    /// Walking away from a resting pointer within reach, the sheep turns
+    /// round, comes back, and ends up nose to it.
+    #[test]
+    fn a_sheep_walking_away_turns_round_to_come_and_look() {
+        let p = pet();
+        let w = world_with_the_pointer_at(800.0, 1040.0);
+        let mut s = Sheep::new(false);
+        let mut ev = Vec::new();
+        s.x = 1000.0;
+        s.y = 1040.0;
+        // Flipped, `walk` travels right: away from the pointer at 800.
+        s.flipped = true;
+        s.begin(&p, &w, TILE, 1, &mut ev);
+
+        let mut furthest_right = s.x;
+        for _ in 0..300 {
+            s.step(&p, &w, TILE, &mut ev);
+            furthest_right = furthest_right.max(s.x);
+            if s.x == 800.0 {
+                assert!(
+                    furthest_right < 1000.0 + POINTER_REACH,
+                    "the sheep left the pointer's reach before turning back"
+                );
+                return;
+            }
+        }
+        panic!("walked off and never came back to look: ended at x={}", s.x);
+    }
+
+    /// Nothing drags a sheep across the screen from the far side.
+    #[test]
+    fn a_pointer_out_of_reach_is_not_noticed() {
+        let p = pet();
+        // Well beyond POINTER_REACH of a sheep starting at 1000.
+        let w = world_with_the_pointer_at(100.0, 1040.0);
+        let mut s = Sheep::new(false);
+        let mut ev = Vec::new();
+        s.x = 1000.0;
+        s.y = 1040.0;
+        s.flipped = true;
+        s.begin(&p, &w, TILE, 1, &mut ev);
+        for _ in 0..20 {
+            s.step(&p, &w, TILE, &mut ev);
+        }
+        assert!(s.x > 1000.0, "a sheep turned back for a pointer far out of reach");
+    }
+
+    /// Once it has had its look the spot is old news, and walked through.
+    #[test]
+    fn a_pointer_the_sheep_has_looked_at_stops_being_interesting() {
+        let p = pet();
+        let w = world_with_the_pointer_at(900.0, 1040.0);
+        let mut s = Sheep::new(false);
+        let mut ev = Vec::new();
+        s.x = 1011.0;
+        s.y = 1040.0;
+        s.begin(&p, &w, TILE, 1, &mut ev);
+        for _ in 0..200 {
+            s.step(&p, &w, TILE, &mut ev);
+        }
+        assert_eq!(s.met_pointer, Some((900.0, 1040.0)), "never reached the pointer at all");
+
+        // Set it walking at the same spot again: this time it walks through.
+        s.x = 1011.0;
+        s.y = 1040.0;
+        s.flipped = false;
+        s.begin(&p, &w, TILE, 1, &mut ev);
+        let mut furthest = s.x;
+        for _ in 0..200 {
+            s.step(&p, &w, TILE, &mut ev);
+            furthest = furthest.min(s.x);
+        }
+        assert!(furthest < 900.0, "a pointer it had already looked at stopped it again");
+    }
+
+    /// A sheep asleep, eating or sitting has nowhere to turn to and is not
+    /// disturbed by the mouse; only one on the move goes over to look.
+    #[test]
+    fn a_pointer_does_not_disturb_a_sheep_that_is_not_walking() {
+        let p = pet();
+        let w = world_with_the_pointer_at(900.0, 1040.0);
+        let sleep = p.by_name("sleep2a").expect("the pet has a sleeping animation").id;
+        let mut s = Sheep::new(false);
+        let mut ev = Vec::new();
+        s.x = 1000.0;
+        s.y = 1040.0;
+        s.begin(&p, &w, TILE, sleep, &mut ev);
+        for _ in 0..20 {
+            s.step(&p, &w, TILE, &mut ev);
+            if s.animation != sleep {
+                break;
+            }
+            assert_eq!(s.x, 1000.0, "a sleeping sheep set off towards the pointer");
+        }
+    }
+
     #[test]
     fn a_sheep_in_the_way_turns_another_back_most_of_the_time() {
         let p = pet();
@@ -1738,6 +2024,7 @@ mod tests {
             screens: vec![screen(0, 0.0, 1920.0, 1080.0), screen(1, 1920.0, 960.0, 540.0)],
             windows: vec![],
             flock: vec![],
+            pointer: None,
         };
         let mut s = Sheep::new(false);
         let mut ev = Vec::new();
@@ -1800,6 +2087,7 @@ mod tests {
             }],
             windows: vec![Rect { id: 9, x: 3858.0, y: -26.0, w: 1404.0, h: 1242.0 }],
             flock: vec![],
+            pointer: None,
         };
         let mut s = Sheep::new(false);
         let mut ev = Vec::new();
@@ -1821,6 +2109,7 @@ mod tests {
             screens: vec![screen(0, 0.0, 1920.0, 1080.0), screen(1, 1920.0, 960.0, 540.0)],
             windows: vec![],
             flock: vec![],
+            pointer: None,
         };
         let mut tall = Sheep::new(false);
         tall.x = 100.0;

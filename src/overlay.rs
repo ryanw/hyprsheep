@@ -57,6 +57,17 @@ const SETTLE: Duration = Duration::from_secs(2);
 const IDLE_REFRESH: Duration = Duration::from_secs(2);
 /// Guard against a burst of catch-up steps after the compositor stalls us.
 const MAX_STEPS_PER_FRAME: usize = 8;
+/// How often the pointer's position is re-read while the sheep care where it
+/// is. Often enough to notice the mouse coming to rest, rarely enough to be
+/// one very small socket query a few times a second.
+const CURSOR_POLL: Duration = Duration::from_millis(150);
+/// How long the pointer must hold still before it is a thing in the sheep's
+/// world. Long enough that crossing the screen to click something does not
+/// drag the flock along behind it.
+const CURSOR_STILL: Duration = Duration::from_millis(500);
+/// How far the pointer may drift and still be the same resting place. A mouse
+/// on a desk trembles; a hand let go of it does not mean to move it.
+const CURSOR_DRIFT: f64 = 3.0;
 /// How much of the end of a drag decides how hard the sheep was thrown. Long
 /// enough to average out a jittery mouse, short enough that a drag which came
 /// to rest before letting go is a drop rather than a throw.
@@ -176,6 +187,12 @@ pub struct Overlay {
     /// a drag is in progress - a terminal retitling itself emits a stream of
     /// them - so the busy interval is keyed off the geometry really changing.
     last_change: Instant,
+    /// Where the pointer was when last asked, and when it arrived there. A
+    /// pointer that has been in one place for `CURSOR_STILL` is resting, and
+    /// goes into the world for the sheep to notice.
+    cursor_at: Option<(f64, f64)>,
+    cursor_since: Instant,
+    last_cursor: Instant,
     /// The scene as last handed to the compositor.
     drawn: Vec<Look>,
     /// When the drawn poses were last advanced, which paces interpolation.
@@ -231,6 +248,9 @@ pub fn run(sheet: Sheet, pet: Pet, cfg: Config) -> Result<(), String> {
         dirty: false,
         last_refresh: Instant::now(),
         last_change: Instant::now(),
+        cursor_at: None,
+        cursor_since: Instant::now(),
+        last_cursor: Instant::now() - CURSOR_POLL,
         drawn: Vec::new(),
         last_frame: Instant::now(),
     };
@@ -403,7 +423,11 @@ impl Overlay {
                     self.last_change = Instant::now();
                 }
                 self.monitors = monitors;
-                self.world = World { flock: std::mem::take(&mut self.world.flock), ..world };
+                self.world = World {
+                    flock: std::mem::take(&mut self.world.flock),
+                    pointer: self.world.pointer,
+                    ..world
+                };
                 // A monitor may have been moved or rescaled underneath us.
                 for panel in &mut self.panels {
                     if let Some(m) = self.monitors.iter().find(|m| m.name == panel.name) {
@@ -421,6 +445,45 @@ impl Overlay {
             }
             Err(e) => eprintln!("hyprsheep: layout query failed: {e}"),
         }
+    }
+
+    /// Re-read where the pointer is, and decide whether it is resting.
+    ///
+    /// The sheep are told about a pointer only once it has held still, so
+    /// stillness is measured here rather than in the engine: this is the only
+    /// place that knows how long ago the last reading was taken. Because the
+    /// arrival time is kept rather than a run of samples, a sparse poll still
+    /// measures it correctly - a sheep asleep for ten seconds wakes to a
+    /// pointer that has demonstrably not moved in ten seconds.
+    fn refresh_cursor(&mut self) {
+        if !self.cfg.cursor {
+            return;
+        }
+        // While a sheep is being dragged the pointer is the sheep, and the
+        // rest of the flock has no business reacting to it.
+        if self.pressed.is_some() {
+            self.cursor_at = None;
+            self.world.pointer = None;
+            return;
+        }
+        if self.last_cursor.elapsed() < CURSOR_POLL {
+            return;
+        }
+        self.last_cursor = Instant::now();
+        let Ok(at) = hypr::cursor() else { return };
+
+        let settled = self.cursor_at.is_some_and(|(x, y)| {
+            (x - at.0).abs() <= CURSOR_DRIFT && (y - at.1).abs() <= CURSOR_DRIFT
+        });
+        if !settled {
+            self.cursor_at = Some(at);
+            self.cursor_since = Instant::now();
+        }
+        // The position handed to the sheep is the one it came to rest at, not
+        // the latest reading, so a tremble inside the drift does not keep
+        // making an old resting place look like a new one.
+        self.world.pointer =
+            self.cursor_at.filter(|_| self.cursor_since.elapsed() >= CURSOR_STILL);
     }
 
     /// How often the window layout is worth re-reading: often enough to
@@ -485,6 +548,7 @@ impl Overlay {
 
     fn tick(&mut self) {
         self.refresh_world();
+        self.refresh_cursor();
         // Each sheep collides with where the others are now, which the world
         // query knows nothing about: they are ours, not the compositor's.
         self.world.flock = self.flock.iter().map(|p| p.sheep.bounds(self.tile)).collect();

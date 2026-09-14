@@ -169,7 +169,10 @@ pub fn snapshot(monitors: &mut [Monitor]) -> Result<World, String> {
     Ok(World {
         screens: monitors.iter().map(Monitor::screen).collect(),
         windows,
+        // Both of these are ours rather than the compositor's, and the host
+        // fills them in each frame.
         flock: Vec::new(),
+        pointer: None,
     })
 }
 
@@ -217,6 +220,17 @@ pub fn world() -> Result<(Vec<Monitor>, World), String> {
     let mut m = monitors()?;
     let w = snapshot(&mut m)?;
     Ok((m, w))
+}
+
+/// Where the mouse pointer is, in the same global logical space as the
+/// monitors and the windows.
+///
+/// The overlay's own input region is narrowed to the sheep, so Wayland only
+/// tells us about a pointer that is already over one. Asking the compositor
+/// is the only way to know where it is the rest of the time.
+pub fn cursor() -> Result<(f64, f64), String> {
+    let v = query("j/cursorpos")?;
+    Ok((f(&v, "x"), f(&v, "y")))
 }
 
 /// Watch the event socket, calling `notify` whenever the layout may have moved.
