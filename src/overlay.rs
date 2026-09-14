@@ -39,7 +39,7 @@ use wayland_client::{
 
 use crate::anim::Pet;
 use crate::config::Config;
-use crate::engine::{Event, Sheep, World};
+use crate::engine::{Event, Pose, Sheep, World};
 use crate::hypr;
 use crate::sprites::Sheet;
 
@@ -61,6 +61,14 @@ const MAX_STEPS_PER_FRAME: usize = 8;
 struct Pen {
     sheep: Sheep,
     next_step: Instant,
+    /// When the step the sheep is part-way through was taken, and how long it
+    /// holds for. Together they say how far along that step we are now, which
+    /// is how far between its two poses the sprite should be drawn.
+    step_at: Instant,
+    step_len: Duration,
+    /// The pose actually on screen: the sheep's last two, blended. With
+    /// smoothing off this is simply the sheep's current pose.
+    shown: Pose,
 }
 
 /// One output's overlay surface.
@@ -151,6 +159,8 @@ pub struct Overlay {
     last_change: Instant,
     /// The scene as last handed to the compositor.
     drawn: Vec<Look>,
+    /// When the drawn poses were last advanced, which paces interpolation.
+    last_frame: Instant,
 }
 
 /// Which source pixel a destination pixel takes its colour from, sampling at
@@ -202,6 +212,7 @@ pub fn run(sheet: Sheet, pet: Pet, cfg: Config) -> Result<(), String> {
         last_refresh: Instant::now(),
         last_change: Instant::now(),
         drawn: Vec::new(),
+        last_frame: Instant::now(),
     };
 
     // Outputs already present are announced during the first roundtrip, which
@@ -331,7 +342,14 @@ impl Overlay {
             }
             None => sheep.spawn(&self.pet, &self.world, self.tile, &mut events),
         }
-        self.flock.push(Pen { sheep, next_step: Instant::now() });
+        let now = Instant::now();
+        self.flock.push(Pen {
+            shown: sheep.pose(),
+            sheep,
+            next_step: now,
+            step_at: now,
+            step_len: Duration::ZERO,
+        });
         self.handle(events);
     }
 
@@ -392,8 +410,13 @@ impl Overlay {
     /// When the loop next has something to do: the soonest sheep step, or the
     /// next layout poll.
     fn next_deadline(&self) -> Instant {
+        let now = Instant::now();
         let refresh = self.last_refresh + self.refresh_interval();
-        self.flock.iter().map(|p| p.next_step).fold(refresh, Instant::min)
+        let step = self.flock.iter().map(|p| p.next_step).fold(refresh, Instant::min);
+        match self.next_frame(now) {
+            Some(frame) => step.min(frame),
+            None => step,
+        }
     }
 
     /// How the flock currently looks, in the terms the drawing code uses.
@@ -401,13 +424,13 @@ impl Overlay {
         self.flock
             .iter()
             .map(|pen| {
-                let s = &pen.sheep;
+                let (s, at) = (&pen.sheep, &pen.shown);
                 Look {
-                    x: s.x.round() as i32,
-                    y: (s.y + s.offset_y).round() as i32,
+                    x: at.x.round() as i32,
+                    y: (at.y + at.offset_y).round() as i32,
                     frame: s.frame,
                     flipped: s.flipped,
-                    alpha: (s.opacity.clamp(0.0, 1.0) * 255.0) as u8,
+                    alpha: (at.opacity.clamp(0.0, 1.0) * 255.0) as u8,
                 }
             })
             .collect()
@@ -442,6 +465,10 @@ impl Overlay {
             while now >= pen.next_step && steps < MAX_STEPS_PER_FRAME {
                 let before = pen.sheep.animation;
                 let delay = pen.sheep.step(&self.pet, &self.world, self.tile, &mut events);
+                // The step belongs to the moment it was due, not the moment we
+                // got round to it, so a late wake-up does not stretch the glide.
+                pen.step_at = pen.next_step;
+                pen.step_len = delay;
                 pen.next_step += delay;
                 steps += 1;
                 // Log inside the loop: several steps can run between frames,
@@ -470,6 +497,7 @@ impl Overlay {
             // If we fell far behind, resynchronise rather than sprinting.
             if steps == MAX_STEPS_PER_FRAME && now > pen.next_step {
                 pen.next_step = now;
+                pen.step_at = now;
             }
 
 
@@ -485,6 +513,51 @@ impl Overlay {
         self.handle(events);
 
         self.top_up_flock();
+        self.advance_poses(now);
+    }
+
+    /// Work out where each sheep should be drawn right now.
+    ///
+    /// The engine moves in hops: `walk` covers two pixels every tenth of a
+    /// second, which on a modern screen reads as a stutter. Rather than change
+    /// what the pet file says, the sprite is drawn part-way between the pose the
+    /// sheep stepped from and the one it stepped to, arriving just as the next
+    /// step falls due. That costs one step of latency, which at these
+    /// intervals is not something an eye can catch.
+    ///
+    /// Only the position, draw offset and opacity are blended. The frames
+    /// themselves are pixel art with two-frame walk cycles; blending those
+    /// would be a smear, not an improvement.
+    fn advance_poses(&mut self, now: Instant) {
+        self.last_frame = now;
+        for pen in &mut self.flock {
+            let len = pen.step_len.as_secs_f64();
+            // Smoothing off, or a step with no duration to speak of, asks for
+            // the pose the sheep actually stepped to and nothing in between.
+            let t = if self.cfg.smooth == 0 || len <= 0.0 {
+                1.0
+            } else {
+                now.saturating_duration_since(pen.step_at).as_secs_f64() / len
+            };
+            pen.shown = pen.sheep.pose_at(t);
+        }
+    }
+
+    /// When the next interpolated frame is due, if one is.
+    ///
+    /// A sheep standing still, napping or simply between two steps that did
+    /// not move it, has nothing to draw in between, so this is `None` and the
+    /// loop sleeps until the next step exactly as it did before smoothing
+    /// existed. Interpolation costs frames only while something is moving.
+    fn next_frame(&self, now: Instant) -> Option<Instant> {
+        if self.cfg.smooth == 0 {
+            return None;
+        }
+        let mid_glide = |p: &Pen| p.sheep.gliding() && now < p.step_at + p.step_len;
+        self.flock
+            .iter()
+            .any(mid_glide)
+            .then(|| self.last_frame + Duration::from_secs_f64(1.0 / self.cfg.smooth as f64))
     }
 
     /// Keep the configured number of ordinary sheep on screen. Companions are
@@ -499,8 +572,8 @@ impl Overlay {
     /// The topmost sheep whose sprite covers a global point.
     fn sheep_at(&self, x: f64, y: f64) -> Option<usize> {
         self.flock.iter().rposition(|pen| {
-            let top = pen.sheep.y + pen.sheep.offset_y;
-            x >= pen.sheep.x && x < pen.sheep.x + self.tile && y >= top && y < top + self.tile
+            let top = pen.shown.y + pen.shown.offset_y;
+            x >= pen.shown.x && x < pen.shown.x + self.tile && y >= top && y < top + self.tile
         })
     }
 
@@ -606,11 +679,11 @@ impl Overlay {
         let mut spans: Vec<(i32, i32)> = Vec::new();
 
         for pen in &self.flock {
-            let s = &pen.sheep;
+            let (s, at) = (&pen.sheep, &pen.shown);
             // Global position translated into this output's own space; a sheep
             // straddling two outputs is drawn on both and clipped by each.
-            let lx = s.x - panel.origin.0;
-            let ly = s.y + s.offset_y - panel.origin.1;
+            let lx = at.x - panel.origin.0;
+            let ly = at.y + at.offset_y - panel.origin.1;
             if lx + self.tile <= 0.0
                 || ly + self.tile <= 0.0
                 || lx >= panel.width as f64
@@ -630,7 +703,7 @@ impl Overlay {
             let sy0 = (row as f64 * self.src_h).round() as u32;
             let ox = lx.round() as i32 * scale;
             let oy = ly.round() as i32 * scale;
-            let alpha = s.opacity.clamp(0.0, 1.0);
+            let alpha = at.opacity.clamp(0.0, 1.0);
 
             // The box it occupies in the buffer, clipped to it.
             let (x0, y0) = (ox.clamp(0, bw), oy.clamp(0, bh));

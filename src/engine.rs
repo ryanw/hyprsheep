@@ -106,6 +106,32 @@ pub enum Event {
     Died,
 }
 
+/// What the sheep looks like at one instant: where it is and how solid.
+///
+/// The engine moves in discrete hops - two pixels, then nothing for a tenth
+/// of a second - so a sheep is kept as two of these, the pose it stepped from
+/// and the pose it stepped to, and drawn somewhere between the two.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Pose {
+    pub x: f64,
+    pub y: f64,
+    pub offset_y: f64,
+    pub opacity: f64,
+}
+
+impl Pose {
+    /// Blend towards `to`, with `t` running 0 (here) to 1 (arrived).
+    fn lerp(self, to: Pose, t: f64) -> Pose {
+        let at = |a: f64, b: f64| a + (b - a) * t;
+        Pose {
+            x: at(self.x, to.x),
+            y: at(self.y, to.y),
+            offset_y: at(self.offset_y, to.offset_y),
+            opacity: at(self.opacity, to.opacity),
+        }
+    }
+}
+
 pub struct Sheep {
     /// Position of the sprite's top-left corner, in logical pixels.
     pub x: f64,
@@ -128,6 +154,11 @@ pub struct Sheep {
     /// up as the wait between steps, so animation and movement speed up
     /// together and what the sheep chooses to do is untouched.
     pub speed: f64,
+
+    /// The pose the current step set out from. Equal to the current pose
+    /// whenever the sheep was placed rather than moved, which is what stops a
+    /// spawn or a drag from being drawn as a glide across the screen.
+    prev: Pose,
 
     /// Stable per-sheep personality value in 0..100.
     rand_s: f64,
@@ -159,11 +190,39 @@ impl Sheep {
             is_child,
             scale: 1.0,
             speed: 1.0,
+            prev: Pose { x: 0.0, y: 0.0, offset_y: 0.0, opacity: 1.0 },
             rand_s: fastrand::f64() * 100.0,
             resting_on: None,
             situation: Situation::default(),
             steps: 1,
         }
+    }
+
+    /// Where the sheep has stepped to.
+    pub fn pose(&self) -> Pose {
+        Pose { x: self.x, y: self.y, offset_y: self.offset_y, opacity: self.opacity }
+    }
+
+    /// The pose to draw `t` of the way through the current step, with `t`
+    /// running 0 at the moment the step was taken to 1 when the next is due.
+    /// At `t = 1` this is exactly [`pose`](Self::pose), so a host that does
+    /// not interpolate simply passes 1 and gets the stepped motion back.
+    pub fn pose_at(&self, t: f64) -> Pose {
+        self.prev.lerp(self.pose(), t.clamp(0.0, 1.0))
+    }
+
+    /// Whether there is any ground between the last pose and this one - that
+    /// is, whether drawing the sheep again before its next step would show
+    /// anything different.
+    pub fn gliding(&self) -> bool {
+        self.prev != self.pose()
+    }
+
+    /// Declare the sheep to be where it is, with nothing to glide across.
+    /// Used wherever it is placed outright rather than moved: a spawn, a
+    /// drag, a companion set down by its parent.
+    fn settle(&mut self) {
+        self.prev = self.pose();
     }
 
     /// The screen the sheep is currently on.
@@ -237,6 +296,7 @@ impl Sheep {
     /// companion sheep, whose animation and position the parent dictates.
     pub fn begin(&mut self, pet: &Pet, world: &World, tile: f64, id: u32, events: &mut Vec<Event>) {
         self.enter(pet, world, tile, id, events);
+        self.settle();
     }
 
     /// Place the sheep at a weighted-random spawn point and start its animation.
@@ -254,6 +314,7 @@ impl Sheep {
         self.flipped = false;
         self.resting_on = None;
         self.enter(pet, world, tile, next, events);
+        self.settle();
     }
 
     /// Begin a drag: the mouse takes over positioning until released.
@@ -277,6 +338,8 @@ impl Sheep {
     pub fn drag_to(&mut self, x: f64, y: f64, tile: f64) {
         self.x = x - tile / 2.0;
         self.y = y - tile / 2.0;
+        // The pointer is the position; trailing behind it would feel broken.
+        self.settle();
     }
 
     /// Is the sheep's foot line resting on this rectangle's top edge?
@@ -307,6 +370,7 @@ impl Sheep {
         };
 
         self.frame = anim.frame_at(self.step);
+        self.prev = self.pose();
 
         // Dragging freezes physics but keeps the sprite animating, at the
         // sheep's own pace like every other animation.
@@ -627,6 +691,79 @@ mod tests {
         assert_eq!(fast_x, slow_x, "the stride itself is unchanged");
         // Even a very fast sheep leaves the event loop time to breathe.
         assert!(run(10.0).0 >= Duration::from_millis(10));
+    }
+
+    /// Between two steps the sprite is drawn part-way along, arriving exactly
+    /// as the next step falls due.
+    #[test]
+    fn the_sprite_is_drawn_between_the_steps_it_takes() {
+        let p = pet();
+        let w = world();
+        let mut s = Sheep::new(false);
+        let mut ev = Vec::new();
+        s.x = 500.0;
+        s.y = 100.0;
+        // Animation 1 is `walk`, whose velocity is -2 per step.
+        s.begin(&p, &w, TILE, 1, &mut ev);
+        assert!(!s.gliding(), "a sheep only just placed has nowhere to glide from");
+
+        let from = s.pose();
+        s.step(&p, &w, TILE, &mut ev);
+        assert!(s.gliding(), "walking should leave something to interpolate");
+        assert_eq!(s.pose_at(0.0), from, "at the start of the step, still where it was");
+        assert_eq!(s.pose_at(1.0), s.pose(), "at the end of the step, arrived");
+        assert_eq!(s.pose_at(0.5).x, from.x - 1.0, "and half a pixel-pair along in between");
+        // The host may ask a moment late, or with a zero-length step; neither
+        // may throw the sheep past where it was actually going.
+        assert_eq!(s.pose_at(2.0), s.pose());
+        assert_eq!(s.pose_at(-1.0), from);
+    }
+
+    /// A sheep that is put somewhere rather than walking there must simply be
+    /// there, not glide across the screen to reach it.
+    #[test]
+    fn a_sheep_that_is_placed_never_glides_from_where_it_was() {
+        let p = pet();
+        let w = world();
+        let mut s = Sheep::new(false);
+        let mut ev = Vec::new();
+        s.x = 500.0;
+        s.y = 100.0;
+        s.begin(&p, &w, TILE, 1, &mut ev);
+        s.step(&p, &w, TILE, &mut ev);
+        assert!(s.gliding());
+
+        // Respawning drops the sheep at a fresh spawn point.
+        s.spawn(&p, &w, TILE, &mut ev);
+        assert!(!s.gliding(), "a spawning sheep should appear, not fly in");
+
+        // The pointer is the position: a dragged sheep must not trail it.
+        s.grab(&p, &w, TILE);
+        s.drag_to(1200.0, 300.0, TILE);
+        assert!(!s.gliding(), "a dragged sheep should sit under the pointer");
+        assert_eq!(s.pose_at(0.0), s.pose());
+    }
+
+    /// Interpolation must cost nothing while the sheep is still: a napping
+    /// sheep leaves the host with no reason to redraw between its steps.
+    #[test]
+    fn a_sheep_that_is_not_moving_has_nothing_to_interpolate() {
+        let p = pet();
+        let w = world();
+        // sleep1b is the long middle of a nap: it neither moves nor fades.
+        let id = p.by_name("sleep1b").unwrap().id;
+        let mut s = Sheep::new(false);
+        let mut ev = Vec::new();
+        s.x = 500.0;
+        s.y = 1040.0;
+        s.begin(&p, &w, TILE, id, &mut ev);
+        for _ in 0..20 {
+            s.step(&p, &w, TILE, &mut ev);
+            if s.animation != id {
+                break;
+            }
+            assert!(!s.gliding(), "a sleeping sheep should ask for no frames of its own");
+        }
     }
 
     #[test]

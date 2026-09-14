@@ -30,6 +30,7 @@ key, and the command line wins:
 
 ```sh
 hyprsheep --sheep 3 --scale 2 --speed 1.5 --monitors eDP-1,HDMI-A-1
+hyprsheep --smooth 0
 hyprsheep --pet ~/pets/green_sheep.xml --trace
 ```
 
@@ -38,6 +39,7 @@ hyprsheep --pet ~/pets/green_sheep.xml --trace
 sheep     = 1      # how many sheep to keep on screen
 scale     = 1      # how big to draw them: 2 is twice the size, 0.5 half
 speed     = 1      # how fast they live: 2 is twice the pace, 0.5 half
+smooth    = 60     # frames per second to glide between steps; 0 for none
 monitors  = "all"  # "all", one name, or ["eDP-1", "HDMI-A-1"]
 draggable = true   # whether the sheep can be picked up with the mouse
 trace     = false  # log every animation change and where the sheep is
@@ -60,6 +62,18 @@ sheep behaves like a small one, just larger.
 `speed` hurries or slows the whole sheep - walking, climbing and the frames
 of every animation alike - by shortening the wait between steps. What the
 sheep chooses to do is untouched; it just gets on with it sooner.
+
+`smooth` fills in the gaps between those steps. The pet file moves the sheep
+in hops - `walk` is two pixels every tenth of a second - which was fine on a
+1995 CRT and reads as a stutter now, so the sprite is drawn part-way along,
+arriving just as the next step falls due. Only the position and the fading
+are blended: the frames are pixel art and smearing them together would be no
+kind of improvement.
+
+Set it to the frame rate you want, up to 240, or to 0 to leave the sheep
+hopping as the file describes. It costs nothing while nothing is moving - a
+sleeping sheep asks for no frames at all - so the idle cost is the same
+either way; a walking one is redrawn up to this many times a second.
 
 With `draggable = false` the overlay is click-through everywhere, with no
 region for the pointer to catch on.

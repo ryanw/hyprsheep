@@ -33,6 +33,10 @@ pub struct Config {
     pub scale: f64,
     /// How fast the sheep lives, as a multiple of its natural pace.
     pub speed: f64,
+    /// How many times a second to redraw between the sheep's own steps, so
+    /// that walking and falling glide rather than jump. 0 turns it off and
+    /// leaves the sheep moving in the discrete hops the pet file describes.
+    pub smooth: u32,
     pub monitors: Monitors,
     /// Whether the sheep can be picked up with the mouse. When off, the
     /// overlay stays entirely click-through.
@@ -50,6 +54,7 @@ impl Default for Config {
             sheep: 1,
             scale: 1.0,
             speed: 1.0,
+            smooth: 60,
             monitors: Monitors::All,
             draggable: true,
             pet: None,
@@ -122,6 +127,7 @@ impl Config {
                 ("scale", Value::Int(n)) if scale_ok(*n as f64) => cfg.scale = *n as f64,
                 ("speed", Value::Float(f)) if speed_ok(*f) => cfg.speed = *f,
                 ("speed", Value::Int(n)) if speed_ok(*n as f64) => cfg.speed = *n as f64,
+                ("smooth", Value::Int(n)) if smooth_ok(*n) => cfg.smooth = *n as u32,
                 ("draggable", Value::Bool(b)) => cfg.draggable = *b,
                 ("monitors", Value::Str(s)) if s == "all" => cfg.monitors = Monitors::All,
                 ("monitors", Value::List(l)) => cfg.monitors = Monitors::Only(l.clone()),
@@ -174,6 +180,17 @@ impl Config {
                         "--speed wants a multiplier between {SPEED_MIN} and {SPEED_MAX}, not {v:?}"
                     ))?;
                 }
+                "--smooth" => {
+                    let v = value()?;
+                    self.smooth = v
+                        .parse::<i64>()
+                        .ok()
+                        .filter(|n| smooth_ok(*n))
+                        .map(|n| n as u32)
+                        .ok_or(format!(
+                            "--smooth wants a frame rate of 0 to {SMOOTH_MAX}, not {v:?}"
+                        ))?;
+                }
                 "--monitors" => {
                     let v = value()?;
                     self.monitors = if v == "all" {
@@ -218,6 +235,14 @@ const SPEED_MAX: f64 = 10.0;
 
 fn speed_ok(f: f64) -> bool {
     f.is_finite() && (SPEED_MIN..=SPEED_MAX).contains(&f)
+}
+
+/// Interpolation is capped at a rate no display will outrun; 0 is the one
+/// value below the floor that means something, namely "don't".
+const SMOOTH_MAX: i64 = 240;
+
+fn smooth_ok(n: i64) -> bool {
+    (0..=SMOOTH_MAX).contains(&n)
 }
 
 /// A boolean flag: bare means on, or an explicit `=true`/`=false`.
@@ -320,6 +345,7 @@ mod tests {
             sheep = 3
             scale = 1.5
             speed = 2
+            smooth = 30
             draggable = false
             monitors = ["eDP-1", "HDMI-A-1"]
             pet = "/tmp/green.xml"
@@ -328,6 +354,7 @@ mod tests {
         assert_eq!(c.sheep, 3);
         assert_eq!(c.scale, 1.5);
         assert_eq!(c.speed, 2.0);
+        assert_eq!(c.smooth, 30);
         assert!(!c.draggable);
         assert_eq!(
             c.monitors,
@@ -378,6 +405,7 @@ mod tests {
         assert_eq!(c.sheep, 4);
         assert_eq!(c.scale, 2.0);
         assert_eq!(args(&["--speed", "0.5"]).unwrap().speed, 0.5);
+        assert_eq!(args(&["--smooth", "144"]).unwrap().smooth, 144);
         assert_eq!(c.monitors, Monitors::Only(vec!["eDP-1".into(), "HDMI-A-1".into()]));
         assert!(!c.draggable);
 
@@ -428,6 +456,11 @@ mod tests {
             vec!["--speed", "quick"],
             vec!["--speed", "0"],
             vec!["--speed", "50"],
+            vec!["--smooth"],
+            vec!["--smooth", "silky"],
+            vec!["--smooth", "-1"],
+            vec!["--smooth", "1000"],
+            vec!["--smooth", "60.5"],
             vec!["--draggable=maybe"],
             vec!["--monitors", ""],
             vec!["--pet"],
@@ -466,6 +499,20 @@ mod tests {
         assert_eq!(parse("speed = 0").speed, 1.0);
         assert_eq!(parse("speed = 99.0").speed, 1.0);
         assert_eq!(parse("speed = brisk").speed, 1.0);
+    }
+
+    #[test]
+    fn smooth_is_a_frame_rate_that_can_be_turned_off() {
+        assert_eq!(Config::default().smooth, 60);
+        assert_eq!(parse("smooth = 30").smooth, 30);
+        // Zero is the one value below the useful range that means something.
+        assert_eq!(parse("smooth = 0").smooth, 0);
+        assert_eq!(args(&["--smooth=0"]).unwrap().smooth, 0);
+        // Out of range, or not a whole number of frames, keeps the default.
+        assert_eq!(parse("smooth = 1000").smooth, 60);
+        assert_eq!(parse("smooth = -1").smooth, 60);
+        assert_eq!(parse("smooth = 59.94").smooth, 60);
+        assert_eq!(parse("smooth = yes").smooth, 60);
     }
 
     #[test]
