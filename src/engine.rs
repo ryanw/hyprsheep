@@ -336,12 +336,36 @@ impl Sheep {
         self.ctx_on(&self.screen(world, tile), tile)
     }
 
+    /// The same context measured in strides rather than pixels.
+    ///
+    /// A repeat count is a number of strides, and a stride grows with the
+    /// sheep, so any length a repeat count is worked out from has to be
+    /// measured in the sheep's own units. Half a screen is half a screen at
+    /// any size, but at scale 2 it is only half as many strides away. Without
+    /// this the two sheep of the black-sheep meeting each walk the pixel count
+    /// of an unscaled screen *times* the scale, and stride straight past each
+    /// other instead of meeting in the middle.
+    fn in_strides(&self, ctx: &Ctx) -> Ctx {
+        let s = self.scale.max(f64::MIN_POSITIVE);
+        Ctx {
+            screen_w: ctx.screen_w / s,
+            screen_h: ctx.screen_h / s,
+            area_w: ctx.area_w / s,
+            area_h: ctx.area_h / s,
+            image_w: ctx.image_w / s,
+            image_h: ctx.image_h / s,
+            image_x: ctx.image_x / s,
+            image_y: ctx.image_y / s,
+            rand_s: ctx.rand_s,
+        }
+    }
+
     /// Enter `id`, resetting the sequence and spawning any companion it declares.
     fn enter(&mut self, pet: &Pet, world: &World, tile: f64, id: u32, events: &mut Vec<Event>) {
         self.animation = id;
         self.step = 0;
         let ctx = self.ctx(world, pet, tile);
-        self.steps = pet.get(id).map(|a| a.steps(&ctx)).unwrap_or(1);
+        self.steps = pet.get(id).map(|a| a.steps(&self.in_strides(&ctx))).unwrap_or(1);
 
         let screen = self.screen(world, tile);
         for c in pet.children.iter().filter(|c| c.animation_id == id) {
@@ -2118,6 +2142,59 @@ mod tests {
             s.step(&p, &w, TILE, &mut ev);
         }
         assert_eq!((s.x, s.y), (x, y), "a caught sheep moved on its own");
+    }
+
+    /// The black-sheep meeting is two walks timed to end nose to nose in the
+    /// middle of the screen. The distance each has to cover is a screen width,
+    /// which does not change with the sheep, so neither should the meeting.
+    #[test]
+    fn the_two_sheep_meet_in_the_middle_at_any_size() {
+        let p = pet();
+        let w = world();
+        for scale in [0.5, 1.0, 2.0, 3.0] {
+            let tile = TILE * scale;
+            let mut ev = Vec::new();
+
+            // The white sheep arrives from the right (spawn 4), the black one
+            // from off the left edge, where the <child> entry puts it.
+            let mut white = Sheep::new(false);
+            white.scale = scale;
+            white.flipped = false;
+            white.x = 1920.0;
+            white.y = 1080.0 - tile;
+            white.begin(&p, &w, tile, 28, &mut ev);
+
+            let mut black = Sheep::new(true);
+            black.scale = scale;
+            black.x = -tile;
+            black.y = white.y;
+            black.begin(&p, &w, tile, 31, &mut ev);
+
+            // Walk them both until each settles into its greeting.
+            for _ in 0..5000 {
+                if p.get(white.animation).unwrap().name != "blacksheepc" {
+                    white.step(&p, &w, tile, &mut ev);
+                }
+                if p.get(black.animation).unwrap().name != "blacksheepy" {
+                    black.step(&p, &w, tile, &mut ev);
+                }
+            }
+            assert_eq!(p.get(white.animation).unwrap().name, "blacksheepc");
+            assert_eq!(p.get(black.animation).unwrap().name, "blacksheepy");
+
+            // Nose to nose: the black sheep to the left, about a sheep apart,
+            // and the pair of them near the middle of the screen.
+            let gap = white.x - black.x;
+            assert!(
+                (0.0..480.0).contains(&gap),
+                "scale {scale}: the sheep ended {gap} apart, not nose to nose"
+            );
+            let middle = (white.x + black.x) / 2.0 + tile / 2.0;
+            assert!(
+                (middle - 960.0).abs() < tile * 2.0,
+                "scale {scale}: they met at {middle}, not in the middle"
+            );
+        }
     }
 
     #[test]
