@@ -31,6 +31,8 @@ pub struct Config {
     pub sheep: usize,
     /// How big to draw the sheep, as a multiple of the sprite's own size.
     pub scale: f64,
+    /// How fast the sheep lives, as a multiple of its natural pace.
+    pub speed: f64,
     pub monitors: Monitors,
     /// Whether the sheep can be picked up with the mouse. When off, the
     /// overlay stays entirely click-through.
@@ -47,6 +49,7 @@ impl Default for Config {
         Config {
             sheep: 1,
             scale: 1.0,
+            speed: 1.0,
             monitors: Monitors::All,
             draggable: true,
             pet: None,
@@ -117,6 +120,8 @@ impl Config {
                 ("sheep", Value::Int(n)) if *n >= 1 => cfg.sheep = *n as usize,
                 ("scale", Value::Float(f)) if scale_ok(*f) => cfg.scale = *f,
                 ("scale", Value::Int(n)) if scale_ok(*n as f64) => cfg.scale = *n as f64,
+                ("speed", Value::Float(f)) if speed_ok(*f) => cfg.speed = *f,
+                ("speed", Value::Int(n)) if speed_ok(*n as f64) => cfg.speed = *n as f64,
                 ("draggable", Value::Bool(b)) => cfg.draggable = *b,
                 ("monitors", Value::Str(s)) if s == "all" => cfg.monitors = Monitors::All,
                 ("monitors", Value::List(l)) => cfg.monitors = Monitors::Only(l.clone()),
@@ -163,6 +168,12 @@ impl Config {
                         "--scale wants a multiplier between {SCALE_MIN} and {SCALE_MAX}, not {v:?}"
                     ))?;
                 }
+                "--speed" => {
+                    let v = value()?;
+                    self.speed = v.parse().ok().filter(|f| speed_ok(*f)).ok_or(format!(
+                        "--speed wants a multiplier between {SPEED_MIN} and {SPEED_MAX}, not {v:?}"
+                    ))?;
+                }
                 "--monitors" => {
                     let v = value()?;
                     self.monitors = if v == "all" {
@@ -199,6 +210,14 @@ const SCALE_MAX: f64 = 20.0;
 
 fn scale_ok(f: f64) -> bool {
     f.is_finite() && (SCALE_MIN..=SCALE_MAX).contains(&f)
+}
+
+/// Likewise the pace: slow enough to watch, fast enough to still be a sheep.
+const SPEED_MIN: f64 = 0.1;
+const SPEED_MAX: f64 = 10.0;
+
+fn speed_ok(f: f64) -> bool {
+    f.is_finite() && (SPEED_MIN..=SPEED_MAX).contains(&f)
 }
 
 /// A boolean flag: bare means on, or an explicit `=true`/`=false`.
@@ -300,6 +319,7 @@ mod tests {
             r#"
             sheep = 3
             scale = 1.5
+            speed = 2
             draggable = false
             monitors = ["eDP-1", "HDMI-A-1"]
             pet = "/tmp/green.xml"
@@ -307,6 +327,7 @@ mod tests {
         );
         assert_eq!(c.sheep, 3);
         assert_eq!(c.scale, 1.5);
+        assert_eq!(c.speed, 2.0);
         assert!(!c.draggable);
         assert_eq!(
             c.monitors,
@@ -356,6 +377,7 @@ mod tests {
             .unwrap();
         assert_eq!(c.sheep, 4);
         assert_eq!(c.scale, 2.0);
+        assert_eq!(args(&["--speed", "0.5"]).unwrap().speed, 0.5);
         assert_eq!(c.monitors, Monitors::Only(vec!["eDP-1".into(), "HDMI-A-1".into()]));
         assert!(!c.draggable);
 
@@ -402,6 +424,10 @@ mod tests {
             vec!["--scale", "-2"],
             vec!["--scale", "1000"],
             vec!["--scale", "inf"],
+            vec!["--speed"],
+            vec!["--speed", "quick"],
+            vec!["--speed", "0"],
+            vec!["--speed", "50"],
             vec!["--draggable=maybe"],
             vec!["--monitors", ""],
             vec!["--pet"],
@@ -428,6 +454,18 @@ mod tests {
         assert_eq!(parse("scale = 100.0").scale, 1.0);
         assert_eq!(parse("scale = huge").scale, 1.0);
         assert_eq!(parse("scale = nan").scale, 1.0);
+    }
+
+    #[test]
+    fn speed_takes_whole_or_fractional_paces() {
+        assert_eq!(Config::default().speed, 1.0);
+        assert_eq!(parse("speed = 3").speed, 3.0);
+        assert_eq!(parse("speed = 0.25").speed, 0.25);
+        assert_eq!(args(&["--speed=1.5"]).unwrap().speed, 1.5);
+        // Out of range, or not a number at all, keeps the default in a file.
+        assert_eq!(parse("speed = 0").speed, 1.0);
+        assert_eq!(parse("speed = 99.0").speed, 1.0);
+        assert_eq!(parse("speed = brisk").speed, 1.0);
     }
 
     #[test]

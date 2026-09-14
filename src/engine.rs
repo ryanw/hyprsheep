@@ -124,6 +124,10 @@ pub struct Sheep {
     /// How big the sheep is drawn, as a multiple of the sprite's own size.
     /// Motion is scaled with it, so a big sheep does not crawl.
     pub scale: f64,
+    /// How fast the sheep lives, as a multiple of its natural pace. It shows
+    /// up as the wait between steps, so animation and movement speed up
+    /// together and what the sheep chooses to do is untouched.
+    pub speed: f64,
 
     /// Stable per-sheep personality value in 0..100.
     rand_s: f64,
@@ -154,6 +158,7 @@ impl Sheep {
             dragging: false,
             is_child,
             scale: 1.0,
+            speed: 1.0,
             rand_s: fastrand::f64() * 100.0,
             resting_on: None,
             situation: Situation::default(),
@@ -303,10 +308,11 @@ impl Sheep {
 
         self.frame = anim.frame_at(self.step);
 
-        // Dragging freezes physics but keeps the sprite animating.
+        // Dragging freezes physics but keeps the sprite animating, at the
+        // sheep's own pace like every other animation.
         if self.dragging {
             self.step += 1;
-            return DRAG_INTERVAL;
+            return self.wait(DRAG_INTERVAL.as_millis() as f64);
         }
 
         let ctx = self.ctx(world, pet, tile);
@@ -344,7 +350,13 @@ impl Sheep {
 
         // The delay uses the post-increment step, as the original does.
         let ms = ramp(&anim.start.interval, &anim.end.interval, self.step);
-        Duration::from_millis(ms.max(10.0) as u64)
+        self.wait(ms)
+    }
+
+    /// How long to hold a step for, hurried or dawdled by `speed`. The floor
+    /// is what stops a fast sheep from spinning the event loop.
+    fn wait(&self, ms: f64) -> Duration {
+        Duration::from_millis((ms / self.speed.max(f64::MIN_POSITIVE)).max(10.0) as u64)
     }
 
     /// Decide which animation to move to, if any, after this step's movement.
@@ -592,6 +604,29 @@ mod tests {
         assert_eq!(step_of(1.0, TILE), -2.0);
         assert_eq!(step_of(2.0, TILE * 2.0), -4.0);
         assert_eq!(step_of(0.5, TILE / 2.0), -1.0);
+    }
+
+    /// Speed is a matter of timing only: the same steps, taken sooner.
+    #[test]
+    fn speed_shortens_the_wait_without_changing_the_walk() {
+        let p = pet();
+        let w = world();
+        let run = |speed: f64| {
+            let mut s = Sheep::new(false);
+            s.speed = speed;
+            let mut ev = Vec::new();
+            s.x = 500.0;
+            s.y = 100.0;
+            s.begin(&p, &w, TILE, 1, &mut ev);
+            let d = s.step(&p, &w, TILE, &mut ev);
+            (d, s.x)
+        };
+        let (slow, slow_x) = run(1.0);
+        let (fast, fast_x) = run(2.0);
+        assert_eq!(fast * 2, slow, "twice the speed is half the wait");
+        assert_eq!(fast_x, slow_x, "the stride itself is unchanged");
+        // Even a very fast sheep leaves the event loop time to breathe.
+        assert!(run(10.0).0 >= Duration::from_millis(10));
     }
 
     #[test]

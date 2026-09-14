@@ -299,6 +299,7 @@ impl Overlay {
     fn add_sheep(&mut self, is_child: bool, start: Option<(u32, f64, f64)>) {
         let mut sheep = Sheep::new(is_child);
         sheep.scale = self.cfg.scale;
+        sheep.speed = self.cfg.speed;
         let mut events = Vec::new();
         match start {
             Some((animation, x, y)) => {

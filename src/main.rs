@@ -27,6 +27,7 @@ usage: hyprsheep [options]
 
   --sheep N             how many sheep to keep on screen
   --scale N             how big to draw them, e.g. 2 or 0.5
+  --speed N             how fast they move and animate, e.g. 2 or 0.5
   --monitors LIST       \"all\", or names: --monitors eDP-1,HDMI-A-1
   --draggable[=BOOL]    whether the sheep can be picked up with the mouse
   --no-draggable        the same as --draggable=false
