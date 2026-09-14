@@ -30,6 +30,9 @@ impl Rect {
     pub fn right(&self) -> f64 {
         self.x + self.w
     }
+    pub fn bottom(&self) -> f64 {
+        self.y + self.h
+    }
 }
 
 /// One monitor, placed in the global coordinate space.
@@ -154,6 +157,10 @@ pub struct Sheep {
     /// up as the wait between steps, so animation and movement speed up
     /// together and what the sheep chooses to do is untouched.
     pub speed: f64,
+    /// Whether window sides are solid. Off, windows are ledges only and the
+    /// sheep walks straight through their sides, as the reference does; on, it
+    /// bumps into them and can climb them the way it climbs a screen edge.
+    pub climb_windows: bool,
 
     /// The pose the current step set out from. Equal to the current pose
     /// whenever the sheep was placed rather than moved, which is what stops a
@@ -172,6 +179,11 @@ pub struct Sheep {
 /// How far past a window's edge the sheep will still step back on. Beyond
 /// this it is not a ledge any more: the window moved out from under it.
 const NUDGE_REACH: f64 = 40.0;
+/// How far past a window's side the sheep may be and still be turned back by
+/// it. Beyond this it did not walk into the side: it was already inside the
+/// window - dropped there, or the window opened around it - and walks out.
+/// A scaled sheep covers more ground per step, so its reach grows with it.
+const SIDE_REACH: f64 = 20.0;
 /// While being dragged the original ignores physics and ticks at a fixed rate.
 const DRAG_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -190,6 +202,7 @@ impl Sheep {
             is_child,
             scale: 1.0,
             speed: 1.0,
+            climb_windows: false,
             prev: Pose { x: 0.0, y: 0.0, offset_y: 0.0, opacity: 1.0 },
             rand_s: fastrand::f64() * 100.0,
             resting_on: None,
@@ -356,6 +369,64 @@ impl Sheep {
         world.windows.iter().find(|r| self.stands_on(r, tile, sticky)).copied()
     }
 
+    /// Is the sheep's body alongside this window's face, rather than resting on
+    /// its top edge? Standing on a ledge puts the feet exactly on `top`, which
+    /// must not count as being inside the window.
+    fn beside(&self, r: &Rect, tile: f64) -> bool {
+        self.climb_windows && self.y + tile > r.top() + 2.0 && self.y < r.bottom()
+    }
+
+    /// Walking into a window's side: the x the sheep is held at, flush against
+    /// the face it hit. `dir` is the direction of travel.
+    ///
+    /// Only a face the sheep has just crossed stops it, so one that starts out
+    /// within a window - dropped in, or the window opened around it - walks out
+    /// rather than being shoved to the nearest edge.
+    fn window_side(&self, world: &World, tile: f64, dir: f64) -> Option<f64> {
+        let faces = world.windows.iter().filter(|r| self.beside(r, tile)).filter_map(|r| {
+            let (edge, past) = if dir < 0.0 {
+                (r.right(), r.right() - self.x)
+            } else {
+                (r.left() - tile, self.x + tile - r.left())
+            };
+            (past > 0.0 && past <= SIDE_REACH * self.scale).then_some(edge)
+        });
+        // Several windows can overlap the sheep; the one that stops it is the
+        // one furthest back along the way it came.
+        match dir {
+            d if d < 0.0 => faces.max_by(f64::total_cmp),
+            d if d > 0.0 => faces.min_by(f64::total_cmp),
+            _ => None,
+        }
+    }
+
+    /// Is the sheep pressed against a window's face, having been stopped by it?
+    fn on_window_side(&self, world: &World, tile: f64) -> bool {
+        world.windows.iter().any(|r| {
+            self.beside(r, tile)
+                && ((self.x - r.right()).abs() < 2.0 || (self.x + tile - r.left()).abs() < 2.0)
+        })
+    }
+
+    /// Climbing a window's face and about to pass its top: the sheep tops out
+    /// onto the ledge instead of carrying on up through the air above it.
+    fn window_crest(&self, world: &World, tile: f64, dir: f64) -> Option<Rect> {
+        if dir >= 0.0 || !self.climb_windows {
+            return None;
+        }
+        let feet = self.y + tile;
+        world
+            .windows
+            .iter()
+            .find(|r| {
+                self.y < r.bottom()
+                    && feet <= r.top() + 2.0
+                    && feet > r.top() - SIDE_REACH * self.scale
+                    && ((self.x - r.right()).abs() < 2.0 || (self.x + tile - r.left()).abs() < 2.0)
+            })
+            .copied()
+    }
+
     /// Advance one animation step. Returns how long to wait before the next.
     pub fn step(
         &mut self,
@@ -488,10 +559,24 @@ impl Sheep {
             self.x = screen.right() - tile;
             hit_border = true;
             self.situation.on_vertical = true;
+        } else if let Some(x) = self.window_side(world, tile, x2) {
+            // A window's side, which is solid only with `climb_windows` on.
+            self.x = x;
+            hit_border = true;
+            self.situation.on_vertical = true;
         } else if y2 < 0.0 && self.y < screen.y && !continues(mid_x, self.y - 1.0) {
             self.y = screen.y;
             hit_border = true;
             self.situation.on_horizontal = true;
+        } else if let Some(r) = self.window_crest(world, tile, y2) {
+            // Over the top of the window it was climbing. The sideways step is
+            // a tile wide - the sheep was hugging the face, and the ledge only
+            // starts a tile in - and lands under the border transition, which
+            // for the climb is the animation for coming over an edge.
+            self.y = r.top().ceil() - tile;
+            self.x = if self.x < r.left() + tile { r.left() + 1.0 } else { r.right() - tile - 1.0 };
+            self.resting_on = Some(r.id);
+            hit_border = true;
         } else if y2 > 0.0 && self.y > floor && !continues(mid_x, self.y + tile + 1.0) {
             self.y = floor;
             self.resting_on = None;
@@ -591,7 +676,9 @@ impl Sheep {
         self.situation = Situation {
             on_window,
             on_taskbar: self.y >= floor - 2.0,
-            on_vertical: self.x <= screen.x || self.x >= screen.right() - tile,
+            on_vertical: self.x <= screen.x
+                || self.x >= screen.right() - tile
+                || self.on_window_side(world, tile),
             on_horizontal: self.y <= screen.y || self.y >= floor - 2.0,
         };
     }
@@ -960,32 +1047,37 @@ mod tests {
         w.windows.push(Rect { id: 1, x: 12.0, y: 562.0, w: 851.0, h: 506.0 });
         w.windows.push(Rect { id: 2, x: 877.0, y: 42.0, w: 506.0, h: 1026.0 });
 
-        let mut s = Sheep::new(false);
-        let mut ev = Vec::new();
-        s.spawn(&p, &w, TILE, &mut ev);
+        // Solid window sides put the sheep up the face of one, which must not
+        // become a way of walking about in mid-air either.
+        for climb in [false, true] {
+            let mut s = Sheep::new(false);
+            s.climb_windows = climb;
+            let mut ev = Vec::new();
+            s.spawn(&p, &w, TILE, &mut ev);
 
-        let mut airborne_run = 0;
-        let mut worst = 0;
-        for _ in 0..200_000 {
-            s.step(&p, &w, TILE, &mut ev);
-            let floor = s.screen(&w, TILE).floor() - TILE;
-            let grounded = s.resting_on.is_some() || s.y >= floor - 2.0;
-            // Animations that declare gravity are the walking-about ones; the
-            // rest are deliberately airborne (falling, jumping, climbing).
-            let should_fall = !grounded && !p.get(s.animation).unwrap().gravity.is_empty();
-            airborne_run = if should_fall { airborne_run + 1 } else { 0 };
-            worst = worst.max(airborne_run);
-            assert!(
-                airborne_run < 3,
-                "walked {airborne_run} steps in mid-air: anim {} ({}) at ({:.0},{:.0}), resting {:?}",
-                s.animation,
-                p.get(s.animation).unwrap().name,
-                s.x,
-                s.y,
-                s.resting_on
-            );
+            let mut airborne_run = 0;
+            let mut worst = 0;
+            for _ in 0..200_000 {
+                s.step(&p, &w, TILE, &mut ev);
+                let floor = s.screen(&w, TILE).floor() - TILE;
+                let grounded = s.resting_on.is_some() || s.y >= floor - 2.0;
+                // Animations that declare gravity are the walking-about ones; the
+                // rest are deliberately airborne (falling, jumping, climbing).
+                let should_fall = !grounded && !p.get(s.animation).unwrap().gravity.is_empty();
+                airborne_run = if should_fall { airborne_run + 1 } else { 0 };
+                worst = worst.max(airborne_run);
+                assert!(
+                    airborne_run < 3,
+                    "{airborne_run} steps in mid-air: anim {} ({}) at ({:.0},{:.0}), resting {:?}",
+                    s.animation,
+                    p.get(s.animation).unwrap().name,
+                    s.x,
+                    s.y,
+                    s.resting_on
+                );
+            }
+            assert!(worst <= 2, "worst airborne run was {worst} (climb_windows={climb})");
         }
-        assert!(worst <= 2, "worst airborne run was {worst}");
     }
 
     /// Stepping just off a ledge nudges the sheep back on, but a window that
@@ -1089,6 +1181,126 @@ mod tests {
             s.step(&p, &w, TILE, &mut ev);
             assert!(s.x <= 2840.0, "sheep walked off the right of the desktop (x={})", s.x);
         }
+    }
+
+    /// A window standing on the floor, for the sheep to walk into the side of.
+    fn world_with_a_tall_window() -> World {
+        let mut w = world();
+        w.windows.push(Rect { id: 5, x: 200.0, y: 600.0, w: 800.0, h: 480.0 });
+        w
+    }
+
+    #[test]
+    fn a_window_side_stops_the_sheep_only_when_it_is_asked_to() {
+        let p = pet();
+        let w = world_with_a_tall_window();
+
+        // Walking left along the floor, towards the window's right face.
+        let walk = |climb: bool| {
+            let mut s = Sheep::new(false);
+            s.climb_windows = climb;
+            let mut ev = Vec::new();
+            s.x = 1010.0;
+            s.y = 1040.0;
+            s.begin(&p, &w, TILE, 1, &mut ev);
+            let mut furthest = s.x;
+            for _ in 0..200 {
+                s.step(&p, &w, TILE, &mut ev);
+                furthest = furthest.min(s.x);
+            }
+            furthest
+        };
+
+        // Off, the side is not there at all: the sheep walks straight in.
+        assert!(walk(false) < 900.0, "sheep was stopped by a window it should ignore");
+        // On, it gets no further than flush against the face.
+        assert!(walk(true) >= 1000.0, "sheep walked through the side of a window");
+    }
+
+    /// Which is what makes the climbing animations eligible: `walk` offers
+    /// vertical_walk_up on a border, but only for `vertical`.
+    #[test]
+    fn hitting_a_window_side_counts_as_being_against_a_wall() {
+        let p = pet();
+        let w = world_with_a_tall_window();
+        let mut s = Sheep::new(false);
+        s.climb_windows = true;
+        let mut ev = Vec::new();
+        s.x = 1004.0;
+        s.y = 1040.0;
+        s.begin(&p, &w, TILE, 1, &mut ev);
+
+        for _ in 0..4 {
+            s.step(&p, &w, TILE, &mut ev);
+        }
+        assert_eq!(s.x, 1000.0, "not held against the window's right face");
+        assert!(s.situation.on_vertical, "a window face did not count as vertical");
+    }
+
+    #[test]
+    fn climbing_a_window_side_tops_out_on_its_ledge() {
+        let p = pet();
+        let w = world_with_a_tall_window();
+        // Both faces: the sheep climbs whichever one it walked into.
+        for (name, x) in [("right", 1000.0), ("left", 160.0)] {
+            let mut s = Sheep::new(false);
+            s.climb_windows = true;
+            let mut ev = Vec::new();
+            s.x = x;
+            s.y = 700.0;
+            // vertical_walk_up, which is where a border on a face leads.
+            s.begin(&p, &w, TILE, 37, &mut ev);
+
+            let mut topped_out = false;
+            for _ in 0..80 {
+                s.step(&p, &w, TILE, &mut ev);
+                if s.resting_on == Some(5) {
+                    topped_out = true;
+                    break;
+                }
+            }
+            assert!(topped_out, "climbing the {name} face ended at ({}, {})", s.x, s.y);
+            assert_eq!(s.y + TILE, 600.0, "{name}: feet are not on the window's top edge");
+            assert_eq!(
+                s.standing_on(&w, TILE),
+                Some(5),
+                "{name}: topped out beside the ledge rather than on it, at x={}",
+                s.x
+            );
+        }
+    }
+
+    /// Only a face the sheep has just crossed stops it, so one that finds
+    /// itself inside a window - dropped there, or the window opened around it -
+    /// walks out rather than being shoved to the nearest edge.
+    #[test]
+    fn a_sheep_already_inside_a_window_is_not_trapped() {
+        let w = world_with_a_tall_window();
+        let mut s = Sheep::new(false);
+        s.climb_windows = true;
+        s.y = 1040.0;
+
+        s.x = 600.0;
+        assert_eq!(s.window_side(&w, TILE, -2.0), None, "shoved out of a window going left");
+        assert_eq!(s.window_side(&w, TILE, 2.0), None, "shoved out of a window going right");
+
+        // Just inside a face, though, is a sheep that walked into it.
+        s.x = 995.0;
+        assert_eq!(s.window_side(&w, TILE, -2.0), Some(1000.0));
+        s.x = 165.0;
+        assert_eq!(s.window_side(&w, TILE, 2.0), Some(160.0));
+        // And a sheep on the ledge above is beside nothing at all.
+        s.y = 560.0;
+        s.x = 995.0;
+        assert_eq!(s.window_side(&w, TILE, -2.0), None, "a ledge is not a face");
+
+        // A scaled sheep takes proportionally longer strides, so what counts
+        // as having just crossed a face grows with it.
+        s.y = 1040.0;
+        s.x = 960.0;
+        assert_eq!(s.window_side(&w, TILE, -2.0), None, "walked out of a window it was inside");
+        s.scale = 4.0;
+        assert_eq!(s.window_side(&w, TILE, -2.0), Some(1000.0), "a big sheep walked through it");
     }
 
     #[test]

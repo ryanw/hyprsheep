@@ -43,6 +43,7 @@ smooth    = 60     # frames per second to glide between steps; 0 for none
 monitors  = "all"  # "all", one name, or ["eDP-1", "HDMI-A-1"]
 draggable = true   # whether the sheep can be picked up with the mouse
 trace     = false  # log every animation change and where the sheep is
+climb_windows = false  # whether window sides are solid and climbable
 # pet     = "~/pets/green_sheep.xml"
 ```
 
@@ -77,6 +78,12 @@ either way; a walking one is redrawn up to this many times a second.
 
 With `draggable = false` the overlay is click-through everywhere, with no
 region for the pointer to catch on.
+
+With `climb_windows = true` a window is a solid block rather than just a ledge:
+the sheep bumps into its left and right faces and can climb them the way it
+climbs a screen edge, topping out onto the window's upper edge. Off, which is
+the default and what the reference does, only the top edge exists and the sheep
+walks straight through the sides.
 
 `pet` loads an alternative pet in the same XML format, sprite sheet and all -
 these files are self-contained. The green sheep that ships with web-esheep

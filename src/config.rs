@@ -41,6 +41,9 @@ pub struct Config {
     /// Whether the sheep can be picked up with the mouse. When off, the
     /// overlay stays entirely click-through.
     pub draggable: bool,
+    /// Whether window sides are solid. Off, windows are ledges only; on, the
+    /// sheep bumps into their sides and can climb them.
+    pub climb_windows: bool,
     /// An alternative pet file in the same XML format. The sprite sheet is
     /// taken from the file itself.
     pub pet: Option<PathBuf>,
@@ -57,6 +60,7 @@ impl Default for Config {
             smooth: 60,
             monitors: Monitors::All,
             draggable: true,
+            climb_windows: false,
             pet: None,
             trace: false,
         }
@@ -129,6 +133,7 @@ impl Config {
                 ("speed", Value::Int(n)) if speed_ok(*n as f64) => cfg.speed = *n as f64,
                 ("smooth", Value::Int(n)) if smooth_ok(*n) => cfg.smooth = *n as u32,
                 ("draggable", Value::Bool(b)) => cfg.draggable = *b,
+                ("climb_windows", Value::Bool(b)) => cfg.climb_windows = *b,
                 ("monitors", Value::Str(s)) if s == "all" => cfg.monitors = Monitors::All,
                 ("monitors", Value::List(l)) => cfg.monitors = Monitors::Only(l.clone()),
                 ("monitors", Value::Str(s)) => cfg.monitors = Monitors::Only(vec![s.clone()]),
@@ -211,6 +216,8 @@ impl Config {
                 "--pet" => self.pet = Some(expand_tilde(&value()?, home.as_deref())),
                 "--draggable" => self.draggable = flag(inline.as_deref(), &key)?,
                 "--no-draggable" => self.draggable = false,
+                "--climb-windows" => self.climb_windows = flag(inline.as_deref(), &key)?,
+                "--no-climb-windows" => self.climb_windows = false,
                 "--trace" => self.trace = flag(inline.as_deref(), &key)?,
                 "--no-trace" => self.trace = false,
                 other => return Err(format!("unknown option `{other}`")),
@@ -347,6 +354,7 @@ mod tests {
             speed = 2
             smooth = 30
             draggable = false
+            climb_windows = true
             monitors = ["eDP-1", "HDMI-A-1"]
             pet = "/tmp/green.xml"
             "#,
@@ -356,6 +364,7 @@ mod tests {
         assert_eq!(c.speed, 2.0);
         assert_eq!(c.smooth, 30);
         assert!(!c.draggable);
+        assert!(c.climb_windows);
         assert_eq!(
             c.monitors,
             Monitors::Only(vec!["eDP-1".into(), "HDMI-A-1".into()])
@@ -413,6 +422,10 @@ mod tests {
         assert_eq!(args(&["--monitors", "all"]).unwrap().monitors, Monitors::All);
         assert_eq!(args(&["--pet", "/tmp/g.xml"]).unwrap().pet, Some(PathBuf::from("/tmp/g.xml")));
         assert!(args(&["--trace"]).unwrap().trace);
+        assert!(!Config::default().climb_windows);
+        assert!(args(&["--climb-windows"]).unwrap().climb_windows);
+        assert!(!args(&["--climb-windows", "--no-climb-windows"]).unwrap().climb_windows);
+        assert!(!args(&["--climb-windows=false"]).unwrap().climb_windows);
     }
 
     #[test]

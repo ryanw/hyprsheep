@@ -333,6 +333,7 @@ impl Overlay {
         let mut sheep = Sheep::new(is_child);
         sheep.scale = self.cfg.scale;
         sheep.speed = self.cfg.speed;
+        sheep.climb_windows = self.cfg.climb_windows;
         let mut events = Vec::new();
         match start {
             Some((animation, x, y)) => {
