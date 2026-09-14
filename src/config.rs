@@ -60,7 +60,7 @@ impl Default for Config {
             smooth: 60,
             monitors: Monitors::All,
             draggable: true,
-            climb_windows: false,
+            climb_windows: true,
             pet: None,
             trace: false,
         }
@@ -422,7 +422,7 @@ mod tests {
         assert_eq!(args(&["--monitors", "all"]).unwrap().monitors, Monitors::All);
         assert_eq!(args(&["--pet", "/tmp/g.xml"]).unwrap().pet, Some(PathBuf::from("/tmp/g.xml")));
         assert!(args(&["--trace"]).unwrap().trace);
-        assert!(!Config::default().climb_windows);
+        assert!(Config::default().climb_windows);
         assert!(args(&["--climb-windows"]).unwrap().climb_windows);
         assert!(!args(&["--climb-windows", "--no-climb-windows"]).unwrap().climb_windows);
         assert!(!args(&["--climb-windows=false"]).unwrap().climb_windows);

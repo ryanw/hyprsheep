@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use crate::anim::{Action, Animation, Pet, Situation};
+use crate::anim::{Action, Animation, Only, Pet, Situation};
 use crate::expr::{eval_or, Ctx};
 
 /// A rectangle the sheep can stand on the top edge of.
@@ -171,6 +171,10 @@ pub struct Sheep {
     rand_s: f64,
     /// The window we are standing on, if any.
     resting_on: Option<u64>,
+    /// A window whose side the sheep declined to climb or turn at, and is
+    /// walking through. Held until it is clear of that window, so the choice
+    /// is made once per encounter rather than re-rolled every step.
+    passing: Option<u64>,
     situation: Situation,
     /// Cached step count for the current animation.
     steps: u32,
@@ -184,6 +188,10 @@ const NUDGE_REACH: f64 = 40.0;
 /// window - dropped there, or the window opened around it - and walks out.
 /// A scaled sheep covers more ground per step, so its reach grows with it.
 const SIDE_REACH: f64 = 20.0;
+/// How often a window's side that is not being climbed turns the sheep back.
+/// The rest of the time it is walked through, as it would be with the sides
+/// left open. Screen edges are unaffected: those are always walls.
+const TURN_AT_FACE: f64 = 0.2;
 /// While being dragged the original ignores physics and ticks at a fixed rate.
 const DRAG_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -206,6 +214,7 @@ impl Sheep {
             prev: Pose { x: 0.0, y: 0.0, offset_y: 0.0, opacity: 1.0 },
             rand_s: fastrand::f64() * 100.0,
             resting_on: None,
+            passing: None,
             situation: Situation::default(),
             steps: 1,
         }
@@ -376,26 +385,31 @@ impl Sheep {
         self.climb_windows && self.y + tile > r.top() + 2.0 && self.y < r.bottom()
     }
 
-    /// Walking into a window's side: the x the sheep is held at, flush against
-    /// the face it hit. `dir` is the direction of travel.
+    /// Walking into a window's side: the window, and the x the sheep is held
+    /// at flush against the face it hit. `dir` is the direction of travel.
     ///
     /// Only a face the sheep has just crossed stops it, so one that starts out
     /// within a window - dropped in, or the window opened around it - walks out
-    /// rather than being shoved to the nearest edge.
-    fn window_side(&self, world: &World, tile: f64, dir: f64) -> Option<f64> {
-        let faces = world.windows.iter().filter(|r| self.beside(r, tile)).filter_map(|r| {
-            let (edge, past) = if dir < 0.0 {
-                (r.right(), r.right() - self.x)
-            } else {
-                (r.left() - tile, self.x + tile - r.left())
-            };
-            (past > 0.0 && past <= SIDE_REACH * self.scale).then_some(edge)
-        });
+    /// rather than being shoved to the nearest edge. A face it has decided to
+    /// walk through is not there either, until it is clear of that window.
+    fn window_side(&self, world: &World, tile: f64, dir: f64) -> Option<(u64, f64)> {
+        let faces = world
+            .windows
+            .iter()
+            .filter(|r| self.beside(r, tile) && Some(r.id) != self.passing)
+            .filter_map(|r| {
+                let (edge, past) = if dir < 0.0 {
+                    (r.right(), r.right() - self.x)
+                } else {
+                    (r.left() - tile, self.x + tile - r.left())
+                };
+                (past > 0.0 && past <= SIDE_REACH * self.scale).then_some((r.id, edge))
+            });
         // Several windows can overlap the sheep; the one that stops it is the
         // one furthest back along the way it came.
         match dir {
-            d if d < 0.0 => faces.max_by(f64::total_cmp),
-            d if d > 0.0 => faces.min_by(f64::total_cmp),
+            d if d < 0.0 => faces.max_by(|a, b| a.1.total_cmp(&b.1)),
+            d if d > 0.0 => faces.min_by(|a, b| a.1.total_cmp(&b.1)),
             _ => None,
         }
     }
@@ -548,6 +562,38 @@ impl Sheep {
         let mid_x = self.x + tile / 2.0;
         let continues = |x: f64, y: f64| world.screen_at(x, y).is_some();
 
+        // A window whose side was walked through is solid again once the sheep
+        // is clear of it.
+        if let Some(id) = self.passing {
+            let inside = world
+                .find(id)
+                .is_some_and(|r| self.x + tile > r.left() && self.x < r.right());
+            if !inside {
+                self.passing = None;
+            }
+        }
+
+        // What a window's side does is settled before the sheep is held
+        // against it, because walking through means there was no border here
+        // at all. The pet's own table decides whether this is a climb; if it
+        // is not, the side turns the sheep back only now and then, and is
+        // otherwise walked through as it would be with the sides left open.
+        let mut face_stop = None;
+        let mut face_next = None;
+        if let Some((id, edge)) = self.window_side(world, tile, x2) {
+            let stood_at = self.x;
+            self.x = edge;
+            self.update_situation(world, tile, supported_now);
+            let pick = pet.choose(&anim.border, self.situation).map(|n| (n.target, n.only));
+            if matches!(pick, Some((_, Only::Vertical))) || fastrand::f64() < TURN_AT_FACE {
+                face_stop = Some(edge);
+                face_next = pick.map(|(target, _)| target);
+            } else {
+                self.x = stood_at;
+                self.passing = Some(id);
+            }
+        }
+
         if x2 < 0.0 && self.x < screen.x && !continues(self.x - 1.0, mid_y) {
             self.x = screen.x;
             hit_border = true;
@@ -559,7 +605,7 @@ impl Sheep {
             self.x = screen.right() - tile;
             hit_border = true;
             self.situation.on_vertical = true;
-        } else if let Some(x) = self.window_side(world, tile, x2) {
+        } else if let Some(x) = face_stop {
             // A window's side, which is solid only with `climb_windows` on.
             self.x = x;
             hit_border = true;
@@ -634,6 +680,12 @@ impl Sheep {
 
         if hit_border {
             self.update_situation(world, tile, supported_now || nudged);
+            // A face has already drawn from the same table; rolling again here
+            // could contradict the choice that held the sheep in the first
+            // place.
+            if let Some(target) = face_next {
+                return Some(target);
+            }
             if let Some(n) = pet.choose(&anim.border, self.situation) {
                 return Some(n.target);
             }
@@ -1195,7 +1247,8 @@ mod tests {
         let p = pet();
         let w = world_with_a_tall_window();
 
-        // Walking left along the floor, towards the window's right face.
+        // Walking left along the floor, towards the window's right face: how
+        // far in did it get before the face did something about it?
         let walk = |climb: bool| {
             let mut s = Sheep::new(false);
             s.climb_windows = climb;
@@ -1211,10 +1264,20 @@ mod tests {
             furthest
         };
 
-        // Off, the side is not there at all: the sheep walks straight in.
-        assert!(walk(false) < 900.0, "sheep was stopped by a window it should ignore");
-        // On, it gets no further than flush against the face.
-        assert!(walk(true) >= 1000.0, "sheep walked through the side of a window");
+        // Off, the side is not there at all: the sheep always walks straight
+        // in, every time.
+        for _ in 0..50 {
+            assert!(walk(false) < 900.0, "sheep was stopped by a window it should ignore");
+        }
+
+        // On, the face stops it some of the time and is walked through the
+        // rest, so both outcomes must show up over a run of approaches.
+        let (mut stopped, mut through) = (0, 0);
+        for _ in 0..50 {
+            if walk(true) >= 1000.0 { stopped += 1 } else { through += 1 }
+        }
+        assert!(stopped > 0, "a window's side never stopped the sheep at all");
+        assert!(through > 0, "a window's side always stopped the sheep");
     }
 
     /// Which is what makes the climbing animations eligible: `walk` offers
@@ -1223,18 +1286,25 @@ mod tests {
     fn hitting_a_window_side_counts_as_being_against_a_wall() {
         let p = pet();
         let w = world_with_a_tall_window();
-        let mut s = Sheep::new(false);
-        s.climb_windows = true;
-        let mut ev = Vec::new();
-        s.x = 1004.0;
-        s.y = 1040.0;
-        s.begin(&p, &w, TILE, 1, &mut ev);
+        // A face is walked through more often than not, so approach it until
+        // one of the approaches is the kind that stops.
+        for attempt in 0..200 {
+            let mut s = Sheep::new(false);
+            s.climb_windows = true;
+            let mut ev = Vec::new();
+            s.x = 1004.0;
+            s.y = 1040.0;
+            s.begin(&p, &w, TILE, 1, &mut ev);
 
-        for _ in 0..4 {
-            s.step(&p, &w, TILE, &mut ev);
+            for _ in 0..4 {
+                s.step(&p, &w, TILE, &mut ev);
+            }
+            if s.x == 1000.0 {
+                assert!(s.situation.on_vertical, "a window face did not count as vertical");
+                return;
+            }
+            assert!(attempt < 199, "never once held against the window's right face");
         }
-        assert_eq!(s.x, 1000.0, "not held against the window's right face");
-        assert!(s.situation.on_vertical, "a window face did not count as vertical");
     }
 
     #[test]
@@ -1286,9 +1356,9 @@ mod tests {
 
         // Just inside a face, though, is a sheep that walked into it.
         s.x = 995.0;
-        assert_eq!(s.window_side(&w, TILE, -2.0), Some(1000.0));
+        assert_eq!(s.window_side(&w, TILE, -2.0), Some((5, 1000.0)));
         s.x = 165.0;
-        assert_eq!(s.window_side(&w, TILE, 2.0), Some(160.0));
+        assert_eq!(s.window_side(&w, TILE, 2.0), Some((5, 160.0)));
         // And a sheep on the ledge above is beside nothing at all.
         s.y = 560.0;
         s.x = 995.0;
@@ -1300,7 +1370,7 @@ mod tests {
         s.x = 960.0;
         assert_eq!(s.window_side(&w, TILE, -2.0), None, "walked out of a window it was inside");
         s.scale = 4.0;
-        assert_eq!(s.window_side(&w, TILE, -2.0), Some(1000.0), "a big sheep walked through it");
+        assert_eq!(s.window_side(&w, TILE, -2.0), Some((5, 1000.0)), "a big sheep walked through it");
     }
 
     #[test]
