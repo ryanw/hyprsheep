@@ -625,6 +625,17 @@ impl Sheep {
         //    on the direction of travel, exactly as the original does it. An
         //    edge with another monitor behind it is not an edge at all - the
         //    sheep walks straight across the seam.
+        //
+        //    Windows are ours; the reference only ever had the edges of the
+        //    browser. So an animation that declares no `<border>` table is not
+        //    asking to be stopped by one, and windows are not there for it:
+        //    three of them descend without one - the dive into the bath,
+        //    `jump_down` and `fall_winb` - and each has a distance of its own
+        //    to cover. Clamped onto a ledge partway down, there is nothing for
+        //    the engine to move to, and the animation plays out its remaining
+        //    steps sliding along the top of the window. Screen edges and the
+        //    floor still stop them: those are the borders the file was written
+        //    against.
         let mut hit_border = false;
         // Set when the sheep is being stepped back onto a ledge it has just
         // walked off, which counts as still having support this step.
@@ -653,7 +664,8 @@ impl Sheep {
         // otherwise walked through as it would be with the sides left open.
         let mut face_stop = None;
         let mut face_next = None;
-        if let Some((id, edge)) = self.window_side(world, tile, x2) {
+        if let Some((id, edge)) = self.window_side(world, tile, x2).filter(|_| !anim.border.is_empty())
+        {
             let stood_at = self.x;
             self.x = edge;
             self.update_situation(world, tile, supported_now);
@@ -700,7 +712,7 @@ impl Sheep {
             self.y = floor;
             self.resting_on = None;
             hit_border = true;
-        } else if y2 > 0.0 {
+        } else if y2 > 0.0 && !anim.border.is_empty() {
             // Descending: look for a window top to land on.
             if let Some(r) = self.surface_under(world, tile, false) {
                 // The reference refuses to land while the sheep is within one
@@ -1636,6 +1648,60 @@ mod tests {
     /// Each companion runs its own short chain and then dies. The bathtub is
     /// the clearest case: it fills, then stops for good.
     #[test]
+    fn the_dive_into_the_bath_is_not_caught_on_a_window() {
+        let p = pet();
+        let mut w = world();
+        w.windows.push(Rect { id: 1, x: 200.0, y: 600.0, w: 900.0, h: 400.0 });
+        let mut s = Sheep::new(false);
+        s.climb_windows = true;
+        let mut ev = Vec::new();
+        s.x = 900.0;
+        s.y = 200.0;
+        // 21 (batha) is the dive: down and to the left, for a distance of its
+        // own working out, and with no <border> table to be stopped by.
+        s.begin(&p, &w, TILE, 21, &mut ev);
+
+        // A dive long enough to reach the floor is held there, which is right:
+        // the floor is a border the file was written against. Anywhere above
+        // it the sheep should still be descending.
+        let floor = w.screens[0].floor() - TILE;
+        let mut pinned = 0;
+        let mut last_y = s.y;
+        while p.get(s.animation).unwrap().name == "batha" {
+            s.step(&p, &w, TILE, &mut ev);
+            if s.y == last_y && s.y < floor - 2.0 {
+                pinned += 1;
+            }
+            last_y = s.y;
+            assert!(s.resting_on.is_none(), "the dive landed on a window");
+        }
+        assert_eq!(pinned, 0, "the dive stopped descending {pinned} steps early");
+        // It carried on past the window and down to the floor.
+        assert!(s.y > 600.0, "the dive never got below the window, y {}", s.y);
+    }
+
+    #[test]
+    fn a_window_top_is_still_a_ledge_for_anything_that_asks() {
+        let p = pet();
+        let mut w = world();
+        w.windows.push(Rect { id: 1, x: 200.0, y: 600.0, w: 900.0, h: 400.0 });
+        let mut s = Sheep::new(false);
+        let mut ev = Vec::new();
+        s.x = 700.0;
+        s.y = 400.0;
+        // `fall` does declare a <border>, so it lands as it always has.
+        s.begin(&p, &w, TILE, p.fall_animation().unwrap(), &mut ev);
+        for _ in 0..60 {
+            s.step(&p, &w, TILE, &mut ev);
+            if s.resting_on == Some(1) {
+                assert_eq!(s.y, 560.0, "landed somewhere other than the ledge");
+                return;
+            }
+        }
+        panic!("a falling sheep no longer lands on a window, y {}", s.y);
+    }
+
+    #[test]
     fn the_bathtub_fills_and_then_finishes() {
         let p = pet();
         let w = world();
@@ -1845,4 +1911,5 @@ mod tests {
         panic!("terminal child never died");
     }
 }
+
 

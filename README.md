@@ -120,6 +120,15 @@ underfoot. Motion is data too: `<start>` and `<end>` carry per-step velocities
 that ramp across the sequence, which is why falling accelerates without any
 physics code.
 
+Windows are ours - the reference only ever had the edges of the browser - so
+an animation with no `<border>` table of its own is not asking to be stopped
+by one, and windows are not solid for it. Three animations descend without
+one, the dive into the bath among them, and each has a distance of its own to
+cover; caught on a ledge partway down there is nothing for the engine to move
+to, and the animation plays out its remaining steps sliding along the top of
+the window. Screen edges and the floor still stop them, being the borders the
+file was written against.
+
 Window geometry comes from Hyprland's IPC. `.socket.sock` answers `j/clients`
 and `j/monitors`; `.socket2.sock` streams an event per compositor change,
 which is used only as a hint to re-read the layout.
