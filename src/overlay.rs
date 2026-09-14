@@ -5,11 +5,9 @@
 //! each panel draws whichever of them overlap its own output, so a sheep
 //! crossing the seam is simply drawn on both.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use calloop::EventLoop;
+use calloop::{ping::make_ping, EventLoop};
 use calloop_wayland_source::WaylandSource;
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState, FrameCallbackData, Region},
@@ -44,9 +42,16 @@ use crate::sprites::Sheet;
 
 /// Linux input code for the left mouse button.
 const BTN_LEFT: u32 = 0x110;
-/// How often to re-read the window layout even without an event, so that
-/// interactive drags and resizes are followed smoothly.
-const REFRESH: Duration = Duration::from_millis(200);
+/// How often to re-read the window layout while the desktop is busy, so that
+/// interactive drags and resizes are followed smoothly. Hyprland reports the
+/// start of a drag but not each step of it, so this is a poll.
+const BUSY_REFRESH: Duration = Duration::from_millis(200);
+/// How long after the last window actually moved the desktop counts as busy.
+const SETTLE: Duration = Duration::from_secs(2);
+/// How often to re-read it once everything has settled. An event wakes us the
+/// moment the compositor says anything, so this is only a safety net against a
+/// change the event socket never mentioned.
+const IDLE_REFRESH: Duration = Duration::from_secs(2);
 /// Guard against a burst of catch-up steps after the compositor stalls us.
 const MAX_STEPS_PER_FRAME: usize = 8;
 
@@ -113,16 +118,19 @@ pub struct Overlay {
     monitors: Vec<hypr::Monitor>,
     world: World,
     cfg: Config,
-    dirty: Arc<AtomicBool>,
+    /// Set from the Hyprland event socket: the layout may have moved.
+    dirty: bool,
     last_refresh: Instant,
+    /// When a window last actually moved. Events alone are a poor signal that
+    /// a drag is in progress - a terminal retitling itself emits a stream of
+    /// them - so the busy interval is keyed off the geometry really changing.
+    last_change: Instant,
     /// The scene as last handed to the compositor.
     drawn: Vec<Look>,
 }
 
 pub fn run(sheet: Sheet, pet: Pet, cfg: Config) -> Result<(), String> {
     let (monitors, world) = hypr::world()?;
-    let dirty = Arc::new(AtomicBool::new(false));
-    hypr::watch(dirty.clone());
 
     let conn = Connection::connect_to_env().map_err(|e| format!("wayland connect: {e}"))?;
     let (globals, mut queue) =
@@ -156,8 +164,9 @@ pub fn run(sheet: Sheet, pet: Pet, cfg: Config) -> Result<(), String> {
         monitors,
         world,
         cfg,
-        dirty,
+        dirty: false,
         last_refresh: Instant::now(),
+        last_change: Instant::now(),
         drawn: Vec::new(),
     };
 
@@ -183,6 +192,15 @@ pub fn run(sheet: Sheet, pet: Pet, cfg: Config) -> Result<(), String> {
     WaylandSource::new(conn.clone(), queue)
         .insert(event_loop.handle())
         .map_err(|e| format!("event loop: {e}"))?;
+
+    // A compositor event wakes the loop straight away, so the layout is
+    // re-read the moment it changes rather than on the next poll.
+    let (ping, source) = make_ping().map_err(|e| format!("event loop: {e}"))?;
+    event_loop
+        .handle()
+        .insert_source(source, |_, _, overlay: &mut Overlay| overlay.dirty = true)
+        .map_err(|e| format!("event loop: {e}"))?;
+    hypr::watch(move || ping.ping());
 
     loop {
         let timeout = overlay.next_deadline().saturating_duration_since(Instant::now());
@@ -292,15 +310,17 @@ impl Overlay {
     /// Re-read the monitor layout and windows when an event says they may have
     /// changed, or periodically to follow an in-progress drag.
     fn refresh_world(&mut self) {
-        let due =
-            self.dirty.swap(false, Ordering::Relaxed) || self.last_refresh.elapsed() >= REFRESH;
-        if !due {
+        if self.last_refresh.elapsed() < self.refresh_interval() {
             return;
         }
+        self.dirty = false;
         self.last_refresh = Instant::now();
 
         match hypr::world() {
             Ok((monitors, world)) => {
+                if world.windows != self.world.windows {
+                    self.last_change = Instant::now();
+                }
                 self.monitors = monitors;
                 self.world = world;
                 // A monitor may have been moved or rescaled underneath us.
@@ -317,10 +337,24 @@ impl Overlay {
         }
     }
 
+    /// How often the window layout is worth re-reading: often enough to
+    /// follow a drag while one might be going on, rarely once it is over.
+    ///
+    /// A pending event shortens the wait rather than forcing a query outright,
+    /// which bounds the cost of the bursts Hyprland sends for things that
+    /// cannot move a window, such as a terminal retitling itself.
+    fn refresh_interval(&self) -> Duration {
+        if self.dirty || self.last_change.elapsed() < SETTLE {
+            BUSY_REFRESH
+        } else {
+            IDLE_REFRESH
+        }
+    }
+
     /// When the loop next has something to do: the soonest sheep step, or the
     /// next layout poll.
     fn next_deadline(&self) -> Instant {
-        let refresh = self.last_refresh + REFRESH;
+        let refresh = self.last_refresh + self.refresh_interval();
         self.flock.iter().map(|p| p.next_step).fold(refresh, Instant::min)
     }
 
@@ -736,7 +770,7 @@ impl OutputHandler for Overlay {
     }
 
     fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {
-        self.dirty.store(true, Ordering::Relaxed);
+        self.dirty = true;
     }
 
     fn output_destroyed(
@@ -746,7 +780,7 @@ impl OutputHandler for Overlay {
         output: wl_output::WlOutput,
     ) {
         self.panels.retain(|p| p.output != output);
-        self.dirty.store(true, Ordering::Relaxed);
+        self.dirty = true;
     }
 }
 

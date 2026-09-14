@@ -7,8 +7,6 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 
 use serde_json::Value;
 
@@ -182,12 +180,12 @@ pub fn world() -> Result<(Vec<Monitor>, World), String> {
     Ok((m, w))
 }
 
-/// Watch the event socket, raising `dirty` whenever the layout may have moved.
+/// Watch the event socket, calling `notify` whenever the layout may have moved.
 ///
-/// Every event sets the flag rather than matching on specific ones: the set of
+/// Every event notifies rather than matching on specific ones: the set of
 /// events that can move a window is large and version-dependent, and a
 /// re-query is cheap next to getting it wrong.
-pub fn watch(dirty: Arc<AtomicBool>) {
+pub fn watch(notify: impl Fn() + Send + 'static) {
     std::thread::spawn(move || {
         loop {
             match socket_dir().map(|d| d.join(".socket2.sock")).and_then(|p| {
@@ -198,7 +196,7 @@ pub fn watch(dirty: Arc<AtomicBool>) {
                         if line.is_err() {
                             break;
                         }
-                        dirty.store(true, Ordering::Relaxed);
+                        notify();
                     }
                 }
                 Err(e) => eprintln!("hyprsheep: event socket: {e}"),
@@ -206,7 +204,7 @@ pub fn watch(dirty: Arc<AtomicBool>) {
             // The compositor restarted or dropped us; back off and retry so the
             // sheep keeps working across a Hyprland reload.
             std::thread::sleep(std::time::Duration::from_secs(2));
-            dirty.store(true, Ordering::Relaxed);
+            notify();
         }
     });
 }
