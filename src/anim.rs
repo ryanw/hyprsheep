@@ -464,10 +464,10 @@ mod tests {
     fn parses_the_original_pet() {
         let p = pet();
         assert_eq!((p.tiles_x, p.tiles_y), (16, 11));
-        assert_eq!(p.animations.len(), 54);
+        assert_eq!(p.animations.len(), 63);
         assert_eq!(p.spawns.len(), 4);
-        assert_eq!(p.children.len(), 3);
-        for id in 1..=54u32 {
+        assert_eq!(p.children.len(), 4);
+        for id in 1..=63u32 {
             assert!(p.get(id).is_some(), "missing animation {id}");
         }
     }

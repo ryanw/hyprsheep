@@ -742,6 +742,77 @@ mod tests {
         assert_eq!(s.animation, climbing);
     }
 
+    /// The abduction, ported from the green sheep. The sheep screams, a saucer
+    /// fades in above it, and it is lifted away; the saucer then leaves.
+    #[test]
+    fn the_abduction_runs_end_to_end() {
+        let p = pet();
+        let w = world();
+        let scream = p.by_name("scream").unwrap().id;
+        let ship = p.by_name("shipa").unwrap().id;
+
+        let mut s = Sheep::new(false);
+        let mut ev = Vec::new();
+        s.x = 800.0;
+        s.y = 1040.0;
+        s.begin(&p, &w, TILE, scream, &mut ev);
+
+        // The saucer arrives as a companion, well above the sheep.
+        let spawned = ev.iter().find_map(|e| match e {
+            Event::SpawnChild { animation, x, y } if *animation == ship => Some((*x, *y)),
+            _ => None,
+        });
+        let (sx, sy) = spawned.expect("scream should bring on the saucer");
+        assert_eq!(sx, 800.0, "saucer should be directly above the sheep");
+        assert!(sy < s.y - TILE * 3.0, "saucer should be well overhead, got {sy}");
+
+        // The sheep is carried upwards and fades out.
+        let mut rose = false;
+        for _ in 0..2000 {
+            s.step(&p, &w, TILE, &mut ev);
+            if p.get(s.animation).unwrap().name == "kill2" && s.y <= 1020.0 {
+                rose = true;
+                if s.opacity < 0.2 {
+                    break;
+                }
+            }
+        }
+        assert!(rose, "the sheep was never carried off");
+        assert!(s.opacity < 0.2, "the sheep never faded out");
+
+        // kill2 is terminal, so an ordinary sheep starts over rather than dying.
+        let mut settled = Sheep::new(false);
+        settled.x = 800.0;
+        settled.y = 1040.0;
+        settled.begin(&p, &w, TILE, p.by_name("kill2").unwrap().id, &mut ev);
+        ev.clear();
+        for _ in 0..4000 {
+            settled.step(&p, &w, TILE, &mut ev);
+        }
+        assert!(!ev.contains(&Event::Died), "an ordinary sheep should respawn, not die");
+
+        // The saucer fades in, beams, then flies off and is gone.
+        let mut tug = Sheep::new(true);
+        ev.clear();
+        tug.x = 800.0;
+        tug.y = 800.0;
+        tug.begin(&p, &w, TILE, ship, &mut ev);
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..40_000 {
+            ev.clear();
+            tug.step(&p, &w, TILE, &mut ev);
+            seen.insert(p.get(tug.animation).unwrap().name.clone());
+            if ev.contains(&Event::Died) {
+                for want in ["shipb1", "shipb4", "shipc", "shipc2"] {
+                    assert!(seen.contains(want), "saucer skipped {want}: {seen:?}");
+                }
+                assert!(tug.y < 800.0, "the saucer should leave upwards");
+                return;
+            }
+        }
+        panic!("the saucer never left (reached {seen:?})");
+    }
+
     /// The sheep must never carry on walking in mid-air. Whenever it is
     /// unsupported and off the floor in an animation that declares gravity,
     /// it should fall essentially at once.
@@ -992,7 +1063,7 @@ mod tests {
         w.windows.push(Rect { id: 1, x: 200.0, y: 500.0, w: 700.0, h: 500.0 });
         w.windows.push(Rect { id: 2, x: 1000.0, y: 42.0, w: 600.0, h: 900.0 });
 
-        for id in 1..=54u32 {
+        for id in 1..=63u32 {
             let mut s = Sheep::new(false);
             let mut ev = Vec::new();
             s.x = 600.0;
@@ -1026,7 +1097,7 @@ mod tests {
             stack.extend(p.children.iter().filter(|c| c.animation_id == id).map(|c| c.next));
         }
 
-        let orphans: Vec<&str> = (1..=54u32)
+        let orphans: Vec<&str> = (1..=63u32)
             .filter(|i| !seen.contains(i))
             .map(|i| p.get(i).unwrap().name.as_str())
             .collect();

@@ -1456,6 +1456,7 @@
         <next probability="10" only="none">19</next>
         <next probability="3" only="none">17</next>
         <next probability="80" only="none">1</next>
+        <next probability="3" only="taskbar">55</next>
       </sequence>
       <border>
         <next probability="100" only="none">2</next>
@@ -1560,6 +1561,214 @@
         <next probability="100" only="none">1</next>
       </sequence>
     </animation>
+    <animation id="55">
+      <name>scream</name>
+      <start>
+        <x>0</x>
+        <y>0</y>
+        <interval>30</interval>
+        <offsety>0</offsety>
+        <opacity>1.0</opacity>
+      </start>
+      <end>
+        <x>0</x>
+        <y>0</y>
+        <interval>100</interval>
+        <offsety>0</offsety>
+        <opacity>1.0</opacity>
+      </end>
+      <sequence repeat="40" repeatfrom="0">
+        <frame>50</frame>
+        <frame>51</frame>
+        <next probability="100" only="none">56</next>
+      </sequence>
+    </animation>
+    <animation id="56">
+      <name>kill2</name>
+      <start>
+        <x>0</x>
+        <y>0</y>
+        <interval>100</interval>
+        <offsety>0</offsety>
+        <opacity>1.0</opacity>
+      </start>
+      <end>
+        <x>0</x>
+        <y>-5</y>
+        <interval>100</interval>
+        <offsety>0</offsety>
+        <opacity>0.0</opacity>
+      </end>
+      <sequence repeat="10" repeatfrom="1">
+        <frame>3</frame>
+        <frame>96</frame>
+        <frame>96</frame>
+      </sequence>
+    </animation>
+    <animation id="57">
+      <name>shipa</name>
+      <start>
+        <x>0</x>
+        <y>0</y>
+        <interval>100</interval>
+        <offsety>0</offsety>
+        <opacity>0.0</opacity>
+      </start>
+      <end>
+        <x>0</x>
+        <y>0</y>
+        <interval>100</interval>
+        <offsety>0</offsety>
+        <opacity>1.0</opacity>
+      </end>
+      <sequence repeat="5" repeatfrom="0">
+        <frame>158</frame>
+        <frame>159</frame>
+        <frame>160</frame>
+        <frame>161</frame>
+        <next probability="100" only="none">58</next>
+      </sequence>
+    </animation>
+    <animation id="58">
+      <name>shipb1</name>
+      <start>
+        <x>0</x>
+        <y>0</y>
+        <interval>100</interval>
+        <offsety>0</offsety>
+        <opacity>1.0</opacity>
+      </start>
+      <end>
+        <x>0</x>
+        <y>0</y>
+        <interval>100</interval>
+        <offsety>0</offsety>
+        <opacity>1.0</opacity>
+      </end>
+      <sequence repeat="0" repeatfrom="0">
+        <frame>162</frame>
+        <frame>163</frame>
+        <frame>164</frame>
+        <frame>165</frame>
+        <next probability="100" only="none">59</next>
+      </sequence>
+    </animation>
+    <animation id="59">
+      <name>shipb2</name>
+      <start>
+        <x>0</x>
+        <y>0</y>
+        <interval>100</interval>
+        <offsety>0</offsety>
+        <opacity>1.0</opacity>
+      </start>
+      <end>
+        <x>0</x>
+        <y>0</y>
+        <interval>100</interval>
+        <offsety>0</offsety>
+        <opacity>1.0</opacity>
+      </end>
+      <sequence repeat="0" repeatfrom="0">
+        <frame>162</frame>
+        <frame>163</frame>
+        <frame>164</frame>
+        <frame>165</frame>
+        <next probability="100" only="none">60</next>
+      </sequence>
+    </animation>
+    <animation id="60">
+      <name>shipb3</name>
+      <start>
+        <x>0</x>
+        <y>0</y>
+        <interval>100</interval>
+        <offsety>0</offsety>
+        <opacity>1.0</opacity>
+      </start>
+      <end>
+        <x>0</x>
+        <y>0</y>
+        <interval>100</interval>
+        <offsety>0</offsety>
+        <opacity>1.0</opacity>
+      </end>
+      <sequence repeat="0" repeatfrom="0">
+        <frame>162</frame>
+        <frame>163</frame>
+        <frame>164</frame>
+        <frame>165</frame>
+        <next probability="100" only="none">61</next>
+      </sequence>
+    </animation>
+    <animation id="61">
+      <name>shipb4</name>
+      <start>
+        <x>0</x>
+        <y>0</y>
+        <interval>75</interval>
+        <offsety>0</offsety>
+        <opacity>1.0</opacity>
+      </start>
+      <end>
+        <x>0</x>
+        <y>0</y>
+        <interval>75</interval>
+        <offsety>0</offsety>
+        <opacity>1.0</opacity>
+      </end>
+      <sequence repeat="16" repeatfrom="0">
+        <frame>162</frame>
+        <frame>163</frame>
+        <frame>164</frame>
+        <frame>165</frame>
+        <next probability="100" only="none">62</next>
+      </sequence>
+    </animation>
+    <animation id="62">
+      <name>shipc</name>
+      <start>
+        <x>0</x>
+        <y>0</y>
+        <interval>100</interval>
+        <offsety>0</offsety>
+        <opacity>1.0</opacity>
+      </start>
+      <end>
+        <x>0</x>
+        <y>0</y>
+        <interval>100</interval>
+        <offsety>0</offsety>
+        <opacity>1.0</opacity>
+      </end>
+      <sequence repeat="random/20+5" repeatfrom="0">
+        <frame>161</frame>
+        <frame>160</frame>
+        <frame>159</frame>
+        <frame>158</frame>
+        <next probability="100" only="none">63</next>
+      </sequence>
+    </animation>
+    <animation id="63">
+      <name>shipc2</name>
+      <start>
+        <x>0</x>
+        <y>-40</y>
+        <interval>100</interval>
+        <offsety>0</offsety>
+        <opacity>1.0</opacity>
+      </start>
+      <end>
+        <x>0</x>
+        <y>-40</y>
+        <interval>100</interval>
+        <offsety>0</offsety>
+        <opacity>1.0</opacity>
+      </end>
+      <sequence repeat="screenW/imageH" repeatfrom="0">
+        <frame>162</frame>
+      </sequence>
+    </animation>
   </animations>
   <childs>
     <child animationid="21">
@@ -1576,6 +1785,11 @@
       <x>-imageW</x>
       <y>imageY</y>
       <next>31</next>
+    </child>
+    <child animationid="55">
+      <x>imageX</x>
+      <y>imageY-imageH*4</y>
+      <next>57</next>
     </child>
   </childs>
 </animations>

@@ -112,7 +112,15 @@ by a test:
   repeats.
 
 `offsety` and `opacity` are also applied; the reference parses them and then
-never uses them.
+never uses them. The abduction relies on it: the saucer fades in and the sheep
+fades out as it is carried off.
+
+One addition rather than a divergence. The sheet has always carried flying
+saucers and aliens that no animation in the eSheep pet file ever used - the
+same unused frames sit in Adrianotiger's C# build too. The abduction sequence
+is ported from the green sheep, which does use them, and needs no sprites the
+original sheet lacks. Only the way into it is ours, hung off taskbar walking
+at odds of roughly one abduction every quarter of an hour.
 
 ## Licence
 
