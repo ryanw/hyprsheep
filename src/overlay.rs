@@ -9,6 +9,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use calloop::EventLoop;
+use calloop_wayland_source::WaylandSource;
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState, FrameCallbackData, Region},
     delegate_registry,
@@ -67,6 +69,24 @@ struct Panel {
     scale: u32,
     /// Global logical position of this output's top-left corner.
     origin: (f64, f64),
+    /// Whether the compositor still owes us a frame callback. Drawing waits
+    /// for it rather than piling commits up.
+    frame_pending: bool,
+    /// Whether what is on screen is known to be out of date.
+    needs_draw: bool,
+}
+
+/// What one sheep looks like on screen, rounded to what actually gets drawn.
+///
+/// The scene is compared against the last one drawn, so a sheep that is
+/// mid-nap — or simply between steps — costs nothing at all.
+#[derive(PartialEq)]
+struct Look {
+    x: i32,
+    y: i32,
+    frame: u32,
+    flipped: bool,
+    alpha: u8,
 }
 
 pub struct Overlay {
@@ -95,6 +115,8 @@ pub struct Overlay {
     cfg: Config,
     dirty: Arc<AtomicBool>,
     last_refresh: Instant,
+    /// The scene as last handed to the compositor.
+    drawn: Vec<Look>,
 }
 
 pub fn run(sheet: Sheet, pet: Pet, cfg: Config) -> Result<(), String> {
@@ -136,6 +158,7 @@ pub fn run(sheet: Sheet, pet: Pet, cfg: Config) -> Result<(), String> {
         cfg,
         dirty,
         last_refresh: Instant::now(),
+        drawn: Vec::new(),
     };
 
     // Outputs already present are announced during the first roundtrip, which
@@ -151,11 +174,26 @@ pub fn run(sheet: Sheet, pet: Pet, cfg: Config) -> Result<(), String> {
     }
     overlay.top_up_flock();
 
+    // The sheep move on their own schedule - a step every 50ms or so, far
+    // less while asleep — so the loop is driven by when the next one is due
+    // rather than by the monitor's refresh rate. Wayland events interrupt the
+    // wait, and a frame is only drawn when the scene has actually changed.
+    let mut event_loop: EventLoop<Overlay> =
+        EventLoop::try_new().map_err(|e| format!("event loop: {e}"))?;
+    WaylandSource::new(conn.clone(), queue)
+        .insert(event_loop.handle())
+        .map_err(|e| format!("event loop: {e}"))?;
+
     loop {
-        queue.blocking_dispatch(&mut overlay).map_err(|e| format!("dispatch: {e}"))?;
+        let timeout = overlay.next_deadline().saturating_duration_since(Instant::now());
+        event_loop
+            .dispatch(Some(timeout), &mut overlay)
+            .map_err(|e| format!("dispatch: {e}"))?;
         if overlay.exit {
             return Ok(());
         }
+        overlay.tick();
+        overlay.redraw_if_changed(&qh);
     }
 }
 
@@ -221,6 +259,8 @@ impl Overlay {
             height: 0,
             scale: 1,
             origin,
+            frame_pending: false,
+            needs_draw: true,
         });
     }
 
@@ -266,11 +306,55 @@ impl Overlay {
                 // A monitor may have been moved or rescaled underneath us.
                 for panel in &mut self.panels {
                     if let Some(m) = self.monitors.iter().find(|m| m.name == panel.name) {
-                        panel.origin = (m.x, m.y);
+                        if panel.origin != (m.x, m.y) {
+                            panel.origin = (m.x, m.y);
+                            panel.needs_draw = true;
+                        }
                     }
                 }
             }
             Err(e) => eprintln!("hyprsheep: layout query failed: {e}"),
+        }
+    }
+
+    /// When the loop next has something to do: the soonest sheep step, or the
+    /// next layout poll.
+    fn next_deadline(&self) -> Instant {
+        let refresh = self.last_refresh + REFRESH;
+        self.flock.iter().map(|p| p.next_step).fold(refresh, Instant::min)
+    }
+
+    /// How the flock currently looks, in the terms the drawing code uses.
+    fn scene(&self) -> Vec<Look> {
+        self.flock
+            .iter()
+            .map(|pen| {
+                let s = &pen.sheep;
+                Look {
+                    x: s.x.round() as i32,
+                    y: (s.y + s.offset_y).round() as i32,
+                    frame: s.frame,
+                    flipped: s.flipped,
+                    alpha: (s.opacity.clamp(0.0, 1.0) * 255.0) as u8,
+                }
+            })
+            .collect()
+    }
+
+    /// Draw, but only what has to be: a panel whose contents are stale and
+    /// that is not already waiting on a frame callback.
+    fn redraw_if_changed(&mut self, qh: &QueueHandle<Self>) {
+        let scene = self.scene();
+        if scene != self.drawn {
+            self.drawn = scene;
+            for panel in &mut self.panels {
+                panel.needs_draw = true;
+            }
+        }
+        for i in 0..self.panels.len() {
+            if self.panels[i].needs_draw && !self.panels[i].frame_pending {
+                self.draw(qh, i);
+            }
         }
     }
 
@@ -349,9 +433,10 @@ impl Overlay {
     }
 
     fn draw(&mut self, qh: &QueueHandle<Self>, index: usize) {
-        self.tick();
-
         let Some(panel) = self.panels.get_mut(index) else { return };
+        // Either this draw brings the panel up to date or it cannot be drawn
+        // at all yet, in which case a configure will ask again.
+        panel.needs_draw = false;
         if panel.width == 0 || panel.height == 0 {
             return;
         }
@@ -455,6 +540,7 @@ impl Overlay {
             return;
         }
         panel.layer.commit();
+        panel.frame_pending = true;
     }
 
     fn panel_of(&self, surface: &wl_surface::WlSurface) -> Option<usize> {
@@ -491,7 +577,11 @@ impl CompositorHandler for Overlay {
         surface: &wl_surface::WlSurface,
         _time: u32,
     ) {
-        if let Some(i) = self.panel_of(surface) {
+        let Some(i) = self.panel_of(surface) else { return };
+        self.panels[i].frame_pending = false;
+        // Nothing has moved since the last commit: leave the screen alone and
+        // let the loop go back to sleep until a sheep is next due to step.
+        if self.panels[i].needs_draw {
             self.draw(qh, i);
         }
     }
@@ -538,7 +628,10 @@ impl LayerShellHandler for Overlay {
             self.panels[i].width = w;
             self.panels[i].height = h;
         }
-        self.draw(qh, i);
+        self.panels[i].needs_draw = true;
+        if !self.panels[i].frame_pending {
+            self.draw(qh, i);
+        }
     }
 }
 

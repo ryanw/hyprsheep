@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+calloop = "0.14.4"
+calloop-wayland-source = "0.4.1"
 fastrand = "2.5.0"
 png = "0.18.1"
 roxmltree = "0.21.1"
