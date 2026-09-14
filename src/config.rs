@@ -1,7 +1,7 @@
 //! Optional configuration, read from `~/.config/hyprsheep/config.toml`.
 //!
 //! Only a flat subset of TOML is understood - `key = value` pairs with string,
-//! integer, boolean and string-array values - which is all the settings need.
+//! number, boolean and string-array values - which is all the settings need.
 //! A missing or malformed file is never fatal: bad lines are reported and the
 //! default is kept, so a typo cannot leave the user without a sheep.
 
@@ -29,6 +29,8 @@ impl Monitors {
 pub struct Config {
     /// How many sheep to keep on screen.
     pub sheep: usize,
+    /// How big to draw the sheep, as a multiple of the sprite's own size.
+    pub scale: f64,
     pub monitors: Monitors,
     /// Whether the sheep can be picked up with the mouse. When off, the
     /// overlay stays entirely click-through.
@@ -44,6 +46,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             sheep: 1,
+            scale: 1.0,
             monitors: Monitors::All,
             draggable: true,
             pet: None,
@@ -112,6 +115,8 @@ impl Config {
         for (key, value) in &seen {
             match (key.as_str(), value) {
                 ("sheep", Value::Int(n)) if *n >= 1 => cfg.sheep = *n as usize,
+                ("scale", Value::Float(f)) if scale_ok(*f) => cfg.scale = *f,
+                ("scale", Value::Int(n)) if scale_ok(*n as f64) => cfg.scale = *n as f64,
                 ("draggable", Value::Bool(b)) => cfg.draggable = *b,
                 ("monitors", Value::Str(s)) if s == "all" => cfg.monitors = Monitors::All,
                 ("monitors", Value::List(l)) => cfg.monitors = Monitors::Only(l.clone()),
@@ -152,6 +157,12 @@ impl Config {
                         .filter(|n| *n >= 1)
                         .ok_or(format!("--sheep wants a number of 1 or more, not {v:?}"))?;
                 }
+                "--scale" => {
+                    let v = value()?;
+                    self.scale = v.parse().ok().filter(|f| scale_ok(*f)).ok_or(format!(
+                        "--scale wants a multiplier between {SCALE_MIN} and {SCALE_MAX}, not {v:?}"
+                    ))?;
+                }
                 "--monitors" => {
                     let v = value()?;
                     self.monitors = if v == "all" {
@@ -181,6 +192,15 @@ impl Config {
     }
 }
 
+/// The sheep may be shrunk or blown up, but not to nothing or to absurdity:
+/// below this it is a speck, above it a wall of wool.
+const SCALE_MIN: f64 = 0.1;
+const SCALE_MAX: f64 = 20.0;
+
+fn scale_ok(f: f64) -> bool {
+    f.is_finite() && (SCALE_MIN..=SCALE_MAX).contains(&f)
+}
+
 /// A boolean flag: bare means on, or an explicit `=true`/`=false`.
 fn flag(inline: Option<&str>, key: &str) -> Result<bool, String> {
     match inline {
@@ -195,6 +215,7 @@ fn flag(inline: Option<&str>, key: &str) -> Result<bool, String> {
 enum Value {
     Str(String),
     Int(i64),
+    Float(f64),
     Bool(bool),
     List(Vec<String>),
 }
@@ -234,6 +255,12 @@ fn parse_value(s: &str) -> Option<Value> {
     if let Ok(n) = s.parse::<i64>() {
         return Some(Value::Int(n));
     }
+    // Only a number written with a point or an exponent is a float; anything
+    // else that parses as one (`inf`, `nan`) is not what the user meant.
+    let written_as_a_number = s.contains(['.', 'e', 'E']);
+    if let Some(f) = s.parse::<f64>().ok().filter(|f| f.is_finite() && written_as_a_number) {
+        return Some(Value::Float(f));
+    }
     if let Some(inner) = s.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
         let items: Option<Vec<String>> = inner
             .split(',')
@@ -272,12 +299,14 @@ mod tests {
         let c = parse(
             r#"
             sheep = 3
+            scale = 1.5
             draggable = false
             monitors = ["eDP-1", "HDMI-A-1"]
             pet = "/tmp/green.xml"
             "#,
         );
         assert_eq!(c.sheep, 3);
+        assert_eq!(c.scale, 1.5);
         assert!(!c.draggable);
         assert_eq!(
             c.monitors,
@@ -323,8 +352,10 @@ mod tests {
 
     #[test]
     fn every_setting_has_a_command_line_form() {
-        let c = args(&["--sheep", "4", "--monitors", "eDP-1,HDMI-A-1", "--no-draggable"]).unwrap();
+        let c = args(&["--sheep", "4", "--scale", "2", "--monitors", "eDP-1,HDMI-A-1", "--no-draggable"])
+            .unwrap();
         assert_eq!(c.sheep, 4);
+        assert_eq!(c.scale, 2.0);
         assert_eq!(c.monitors, Monitors::Only(vec!["eDP-1".into(), "HDMI-A-1".into()]));
         assert!(!c.draggable);
 
@@ -365,6 +396,12 @@ mod tests {
             vec!["--sheep"],
             vec!["--sheep", "lots"],
             vec!["--sheep", "0"],
+            vec!["--scale"],
+            vec!["--scale", "big"],
+            vec!["--scale", "0"],
+            vec!["--scale", "-2"],
+            vec!["--scale", "1000"],
+            vec!["--scale", "inf"],
             vec!["--draggable=maybe"],
             vec!["--monitors", ""],
             vec!["--pet"],
@@ -378,6 +415,19 @@ mod tests {
         assert!(!Config::default().trace);
         assert!(parse("trace = true").trace);
         assert!(!args(&["--trace", "--no-trace"]).unwrap().trace);
+    }
+
+    #[test]
+    fn scale_takes_whole_or_fractional_sizes() {
+        assert_eq!(Config::default().scale, 1.0);
+        assert_eq!(parse("scale = 2").scale, 2.0);
+        assert_eq!(parse("scale = 0.5").scale, 0.5);
+        assert_eq!(args(&["--scale=0.25"]).unwrap().scale, 0.25);
+        // Out of range, or not a number at all, keeps the default in a file.
+        assert_eq!(parse("scale = 0").scale, 1.0);
+        assert_eq!(parse("scale = 100.0").scale, 1.0);
+        assert_eq!(parse("scale = huge").scale, 1.0);
+        assert_eq!(parse("scale = nan").scale, 1.0);
     }
 
     #[test]

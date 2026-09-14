@@ -121,6 +121,9 @@ pub struct Sheep {
     pub dragging: bool,
     /// True for companion sheep, which die instead of respawning.
     pub is_child: bool,
+    /// How big the sheep is drawn, as a multiple of the sprite's own size.
+    /// Motion is scaled with it, so a big sheep does not crawl.
+    pub scale: f64,
 
     /// Stable per-sheep personality value in 0..100.
     rand_s: f64,
@@ -150,6 +153,7 @@ impl Sheep {
             opacity: 1.0,
             dragging: false,
             is_child,
+            scale: 1.0,
             rand_s: fastrand::f64() * 100.0,
             resting_on: None,
             situation: Situation::default(),
@@ -321,11 +325,11 @@ impl Sheep {
             (ramp(&anim.start.x, &anim.end.x, at), ramp(&anim.start.y, &anim.end.y, at));
         // Flipping mirrors horizontal motion only.
         let sign = if self.flipped { -1.0 } else { 1.0 };
-        self.x += (dx * sign).trunc();
-        self.y += dy.trunc();
+        self.x += (dx * sign * self.scale).trunc();
+        self.y += (dy * self.scale).trunc();
 
         // The reference parses these and then never applies them; we do.
-        self.offset_y = ramp(&anim.start.offset_y, &anim.end.offset_y, at);
+        self.offset_y = ramp(&anim.start.offset_y, &anim.end.offset_y, at) * self.scale;
         self.opacity = (anim.start.opacity
             + (anim.end.opacity - anim.start.opacity) * at as f64 / steps as f64)
             .clamp(0.0, 1.0);
@@ -565,6 +569,29 @@ mod tests {
         }
         // A long run should exercise a decent slice of the behaviour graph.
         assert!(visited.len() > 10, "only reached {} animations", visited.len());
+    }
+
+    /// A scaled sheep covers proportionally more ground, so it walks at the
+    /// same apparent speed whatever size it is drawn at.
+    #[test]
+    fn scale_stretches_the_stride() {
+        let p = pet();
+        let w = world();
+        let step_of = |scale: f64, tile: f64| {
+            let mut s = Sheep::new(false);
+            s.scale = scale;
+            let mut ev = Vec::new();
+            s.x = 500.0;
+            s.y = 100.0;
+            // Animation 1 is `walk`, whose velocity is -2 per step.
+            s.begin(&p, &w, tile, 1, &mut ev);
+            let before = s.x;
+            s.step(&p, &w, tile, &mut ev);
+            s.x - before
+        };
+        assert_eq!(step_of(1.0, TILE), -2.0);
+        assert_eq!(step_of(2.0, TILE * 2.0), -4.0);
+        assert_eq!(step_of(0.5, TILE / 2.0), -1.0);
     }
 
     #[test]

@@ -109,10 +109,14 @@ pub struct Overlay {
     panels: Vec<Panel>,
     sheet: Sheet,
     pet: Pet,
-    /// Sprite size. Tiles are not always a whole number of pixels, so the
-    /// sheet is sampled at the exact fraction and the sprite drawn rounded.
+    /// Size of one tile in the sheet. Tiles are not always a whole number of
+    /// pixels, so the sheet is sampled at the exact fraction.
+    src_w: f64,
+    src_h: f64,
+    /// Size the sprite is drawn at, in logical pixels: the tile times the
+    /// configured scale. This is the sheep's size as far as everything else
+    /// is concerned - collision, hit-testing and the input region.
     tile: f64,
-    tile_h: f64,
     flock: Vec<Pen>,
 
     monitors: Vec<hypr::Monitor>,
@@ -129,6 +133,14 @@ pub struct Overlay {
     drawn: Vec<Look>,
 }
 
+/// Which source pixel a destination pixel takes its colour from, sampling at
+/// the centre of the destination pixel so the mapping is symmetric.
+#[inline]
+fn sample(at: i32, dst: i32, src: u32) -> u32 {
+    let i = ((at as f64 + 0.5) / dst.max(1) as f64 * src as f64) as u32;
+    i.min(src.saturating_sub(1))
+}
+
 pub fn run(sheet: Sheet, pet: Pet, cfg: Config) -> Result<(), String> {
     let (monitors, world) = hypr::world()?;
 
@@ -142,8 +154,9 @@ pub fn run(sheet: Sheet, pet: Pet, cfg: Config) -> Result<(), String> {
     let layer_shell =
         LayerShell::bind(&globals, &qh).map_err(|e| format!("wlr-layer-shell: {e}"))?;
     let shm = Shm::bind(&globals, &qh).map_err(|e| format!("wl_shm: {e}"))?;
-    let tile = sheet.width as f64 / pet.tiles_x.max(1) as f64;
-    let tile_h = sheet.height as f64 / pet.tiles_y.max(1) as f64;
+    let src_w = sheet.width as f64 / pet.tiles_x.max(1) as f64;
+    let src_h = sheet.height as f64 / pet.tiles_y.max(1) as f64;
+    let tile = src_w * cfg.scale;
 
     let mut overlay = Overlay {
         registry_state: RegistryState::new(&globals),
@@ -158,8 +171,9 @@ pub fn run(sheet: Sheet, pet: Pet, cfg: Config) -> Result<(), String> {
         panels: Vec::new(),
         sheet,
         pet,
+        src_w,
+        src_h,
         tile,
-        tile_h,
         flock: Vec::new(),
         monitors,
         world,
@@ -284,6 +298,7 @@ impl Overlay {
 
     fn add_sheep(&mut self, is_child: bool, start: Option<(u32, f64, f64)>) {
         let mut sheep = Sheep::new(is_child);
+        sheep.scale = self.cfg.scale;
         let mut events = Vec::new();
         match start {
             Some((animation, x, y)) => {
@@ -492,7 +507,7 @@ impl Overlay {
         // Fully transparent everywhere except the sheep.
         canvas.fill(0);
 
-        let tile = self.tile.round() as u32;
+        let tile = self.tile.round() as i32;
         let region = Region::new(&self.compositor).ok();
 
         for pen in &self.flock {
@@ -511,25 +526,40 @@ impl Overlay {
 
             if self.cfg.draggable {
                 if let Some(r) = &region {
-                    r.add(lx.round() as i32, ly.round() as i32, tile as i32, tile as i32);
+                    r.add(lx.round() as i32, ly.round() as i32, tile, tile);
                 }
             }
 
             let (col, row) = (s.frame % self.pet.tiles_x, s.frame / self.pet.tiles_x);
-            let sx0 = (col as f64 * self.tile).round() as u32;
-            let sy0 = (row as f64 * self.tile_h).round() as u32;
+            let sx0 = (col as f64 * self.src_w).round() as u32;
+            let sy0 = (row as f64 * self.src_h).round() as u32;
             let ox = lx.round() as i32 * scale;
             let oy = ly.round() as i32 * scale;
             let alpha = s.opacity.clamp(0.0, 1.0);
 
-            // Nearest-neighbour upscale by the output scale keeps the pixel art
-            // crisp on HiDPI rather than letting the compositor blur it.
-            for sy in 0..tile {
-                for sx in 0..tile {
+            // The sprite covers this many device pixels: its drawn size times
+            // the output scale.
+            let dev = tile * scale;
+            let src = self.src_w.round().max(1.0) as u32;
+
+            // Nearest-neighbour throughout - both the user's scale and the
+            // output's - keeps the pixel art crisp rather than blurred.
+            for dy in 0..dev {
+                let py = oy + dy;
+                if py < 0 || py >= bh {
+                    continue;
+                }
+                let sy = sample(dy, dev, src);
+                for dx in 0..dev {
+                    let px = ox + dx;
+                    if px < 0 || px >= bw {
+                        continue;
+                    }
+                    let sx = sample(dx, dev, src);
                     // Flipping mirrors the sprite horizontally; the engine
                     // mirrors its velocity to match.
-                    let src_x = if s.flipped { tile - 1 - sx } else { sx };
-                    let [r, g, b, a] = self.sheet.pixel(sx0 + src_x, sy0 + sy);
+                    let sx = if s.flipped { src - 1 - sx } else { sx };
+                    let [r, g, b, a] = self.sheet.pixel(sx0 + sx, sy0 + sy);
                     if a == 0 {
                         continue;
                     }
@@ -540,21 +570,8 @@ impl Overlay {
                     // wl_shm ARGB8888 expects premultiplied alpha.
                     let pm = |c: u8| ((c as u32 * a) / 255) as u8;
                     let argb = u32::from_le_bytes([pm(b), pm(g), pm(r), a as u8]).to_le_bytes();
-
-                    for dy in 0..scale {
-                        let py = oy + sy as i32 * scale + dy;
-                        if py < 0 || py >= bh {
-                            continue;
-                        }
-                        for dx in 0..scale {
-                            let px = ox + sx as i32 * scale + dx;
-                            if px < 0 || px >= bw {
-                                continue;
-                            }
-                            let i = ((py * bw + px) * 4) as usize;
-                            canvas[i..i + 4].copy_from_slice(&argb);
-                        }
-                    }
+                    let i = ((py * bw + px) * 4) as usize;
+                    canvas[i..i + 4].copy_from_slice(&argb);
                 }
             }
         }

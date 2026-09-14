@@ -29,13 +29,14 @@ All optional. Every setting has both a command-line option and a config file
 key, and the command line wins:
 
 ```sh
-hyprsheep --sheep 3 --monitors eDP-1,HDMI-A-1 --no-draggable
+hyprsheep --sheep 3 --scale 2 --monitors eDP-1,HDMI-A-1 --no-draggable
 hyprsheep --pet ~/pets/green_sheep.xml --trace
 ```
 
 ```toml
 # ~/.config/hyprsheep/config.toml
 sheep     = 1      # how many sheep to keep on screen
+scale     = 1      # how big to draw them: 2 is twice the size, 0.5 half
 monitors  = "all"  # "all", one name, or ["eDP-1", "HDMI-A-1"]
 draggable = true   # whether the sheep can be picked up with the mouse
 trace     = false  # log every animation change and where the sheep is
@@ -49,6 +50,11 @@ trace     = false  # log every animation change and where the sheep is
 A bad line in the file is reported and its default kept, so a typo cannot
 leave you without a sheep; a bad command-line option stops instead, since you
 are standing right there to fix it.
+
+`scale` grows or shrinks the sheep, between 0.1 and 20 times its own sprite
+size, nearest-neighbour so the pixel art stays sharp. Everything scales with
+it - how far the sheep walks per step, how wide a ledge it needs - so a big
+sheep behaves like a small one, just larger.
 
 With `draggable = false` the overlay is click-through everywhere, with no
 region for the pointer to catch on.
