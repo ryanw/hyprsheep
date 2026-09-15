@@ -741,6 +741,38 @@ impl Sheep {
             .copied()
     }
 
+    /// Climbing a screen edge and about to pass the floor of the monitor
+    /// beside it: the sheep steps out onto that monitor rather than carrying
+    /// on up a wall that has stopped being one.
+    ///
+    /// This is what a monitor layout that is not one straight row needs. Where
+    /// a tall screen sits beside a short one, the tall screen's edge is solid
+    /// only up to the short screen's floor; above that line there is a desktop
+    /// to step onto, exactly as the top of a window is a ledge to step onto.
+    /// Without it the sheep climbs the whole edge and tops out at the sky,
+    /// never finding the screen it spent the climb walking past.
+    fn screen_crest(&self, world: &World, tile: f64, dir: f64) -> Option<Screen> {
+        if dir >= 0.0 {
+            return None;
+        }
+        let feet = self.y + tile;
+        world
+            .screens
+            .iter()
+            .find(|s| {
+                // Hugging one of its outer faces, with the feet arriving at
+                // its floor line from below. The faces are measured from
+                // outside the screen, so the monitor the sheep is climbing
+                // inside of can never match its own edge.
+                let floor = s.floor();
+                self.y < s.bottom()
+                    && feet <= floor + 2.0
+                    && feet > floor - SIDE_REACH * self.scale
+                    && ((self.x - s.right()).abs() < 2.0 || (self.x + tile - s.x).abs() < 2.0)
+            })
+            .copied()
+    }
+
     /// Advance one animation step. Returns how long to wait before the next.
     pub fn step(
         &mut self,
@@ -1028,6 +1060,15 @@ impl Sheep {
             self.y = screen.y;
             hit_border = true;
             self.situation.on_horizontal = true;
+        } else if let Some(s) = self.screen_crest(world, tile, y2) {
+            // Up past the floor of the monitor beside this edge. The sideways
+            // step is a tile wide, as it is coming over a window's top: the
+            // sheep was hugging the face, so a tile clears it.
+            let hugging_right = (self.x - s.right()).abs() < 2.0;
+            self.y = s.floor() - tile;
+            self.x = if hugging_right { s.right() - tile - 1.0 } else { s.x + 1.0 };
+            self.resting_on = None;
+            hit_border = true;
         } else if let Some(r) = self.window_crest(world, tile, y2) {
             // Over the top of the window it was climbing. The sideways step is
             // a tile wide - the sheep was hugging the face, and the ledge only
@@ -2371,8 +2412,48 @@ mod tests {
 
         for _ in 0..300 {
             s.step(&p, &w, TILE, &mut ev);
-            assert!(s.x <= 1880.0, "sheep walked off into the gap (x={})", s.x);
+            // Past the seam is allowed only up on the short monitor, which the
+            // sheep can reach by climbing; beside it there is nothing to stand
+            // on and nothing to step onto.
+            if s.x > 1880.0 {
+                let feet = s.y + TILE;
+                assert!(feet <= 542.0, "sheep walked off into the gap (x={}, feet={})", s.x, feet);
+            }
         }
+    }
+
+    /// A sideways T: a wide monitor on the left, centred against a tall one on
+    /// the right. The tall screen's left edge is a wall only below the wide
+    /// screen's floor; above that line the sheep steps out onto it instead of
+    /// climbing the rest of the edge.
+    #[test]
+    fn climbing_an_edge_steps_onto_the_monitor_beside_it() {
+        let p = pet();
+        let mut wide = screen(0, 0.0, 1920.0, 1080.0);
+        wide.y = 500.0;
+        let w = World {
+            screens: vec![wide, screen(1, 1920.0, 1440.0, 2560.0)],
+            windows: vec![],
+            flock: vec![],
+            pointer: None,
+        };
+        let mut s = Sheep::new(false);
+        let mut ev = Vec::new();
+        // Hugging the tall screen's left edge, climbing, a little below the
+        // wide screen's floor at y = 1580.
+        s.x = 1920.0;
+        s.y = 1600.0 - TILE;
+        s.begin(&p, &w, TILE, 37, &mut ev);
+
+        for _ in 0..40 {
+            s.step(&p, &w, TILE, &mut ev);
+            if s.screen(&w, TILE).id == 0 {
+                assert_eq!(s.y + TILE, 1580.0, "stepped across but not onto the floor");
+                assert!(s.x < 1880.0, "topped out beside the floor, at x={}", s.x);
+                return;
+            }
+        }
+        panic!("climbed past the monitor beside it (x={}, y={})", s.x, s.y);
     }
 
     #[test]
