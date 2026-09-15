@@ -168,6 +168,15 @@ pub struct Child {
     pub next: u32,
 }
 
+impl Child {
+    /// Whether the companion is placed beside its parent rather than at a
+    /// place on the screen: whether its x is written in terms of where the
+    /// parent is. The flower the sheep eats is; the bath it walks to is not.
+    pub fn beside_parent(&self) -> bool {
+        self.x.contains("imageX")
+    }
+}
+
 #[derive(Debug)]
 pub struct Pet {
     pub tiles_x: u32,

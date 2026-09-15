@@ -420,11 +420,23 @@ impl Sheep {
 
         let screen = self.screen(world, tile);
         for c in pet.children.iter().filter(|c| c.animation_id == id) {
+            // Child coordinates are evaluated against the *parent's* state,
+            // in the parent's screen-local space.
+            let mut x = eval_or(&c.x, &ctx, 0.0);
+            // A companion placed beside its parent belongs beside the sprite
+            // as drawn: the file can only say which side the unflipped sheep
+            // has it on, so a flipped one has it mirrored. Both are a tile
+            // wide, so mirroring the two boxes about the parent's centre
+            // comes out as simply reflecting x in the parent's own. Without
+            // this the flower sprouts behind the sheep's tail whenever it
+            // came to eat facing right, which is half the time: eating is
+            // reached from the border turn, and it turns at either border.
+            if self.flipped && c.beside_parent() {
+                x = 2.0 * ctx.image_x - x;
+            }
             events.push(Event::SpawnChild {
                 animation: c.next,
-                // Child coordinates are evaluated against the *parent's* state,
-                // in the parent's screen-local space.
-                x: screen.x + eval_or(&c.x, &ctx, 0.0),
+                x: screen.x + x,
                 y: screen.y + eval_or(&c.y, &ctx, 0.0),
                 rand_s: self.rand_s,
                 workspace: self.workspace,
@@ -3001,6 +3013,74 @@ mod tests {
                 "scale {scale}: they met at {middle}, not in the middle"
             );
         }
+    }
+
+    /// The flower belongs in front of the sheep's nose, whichever way round
+    /// it came to eat.
+    #[test]
+    fn the_flower_is_on_the_side_the_sheep_is_facing() {
+        let p = pet();
+        let w = world();
+        let eat = p.by_name("eat").expect("the pet eats").id;
+
+        let mut left = Sheep::new(false);
+        let mut ev = Vec::new();
+        left.x = 900.0;
+        left.y = 1040.0;
+        left.flipped = false;
+        left.begin(&p, &w, TILE, eat, &mut ev);
+        let Some(&Event::SpawnChild { x: facing_left, .. }) = ev.first() else {
+            panic!("eat should spawn the flower, got {ev:?}");
+        };
+        assert!(facing_left < left.x, "the flower sprouted behind a sheep facing left");
+
+        let mut right = Sheep::new(false);
+        ev.clear();
+        right.x = 900.0;
+        right.y = 1040.0;
+        right.flipped = true;
+        right.begin(&p, &w, TILE, eat, &mut ev);
+        let Some(&Event::SpawnChild { x: facing_right, .. }) = ev.first() else {
+            panic!("eat should spawn the flower, got {ev:?}");
+        };
+        assert!(
+            facing_right > right.x,
+            "the flower sprouted behind a sheep facing right, at {facing_right}"
+        );
+
+        // Mirrored, so the same distance from the nose either way round. The
+        // spawn point is a corner, so the two are compared centre to centre.
+        let centre = right.x + TILE / 2.0;
+        let (l, r) = (facing_left + TILE / 2.0 - centre, facing_right + TILE / 2.0 - centre);
+        assert!(
+            (l + r).abs() < 1e-6,
+            "the flower sits closer on one side: {l} away and {r} away"
+        );
+    }
+
+    /// A companion that belongs at a place on the screen rather than beside
+    /// the sheep stays put when the sheep is facing the other way.
+    #[test]
+    fn a_screen_placed_companion_is_not_mirrored() {
+        let p = pet();
+        let w = world();
+        let bath = p.by_name("batha").expect("the pet takes a bath").id;
+        let place = |flipped| {
+            let mut s = Sheep::new(false);
+            let mut ev = Vec::new();
+            s.x = 900.0;
+            s.y = 1040.0;
+            s.flipped = flipped;
+            // The bath's place is drawn from randS: the same for both sheep,
+            // so that only the facing differs.
+            s.rand_s = 60.0;
+            s.begin(&p, &w, TILE, bath, &mut ev);
+            match ev.first() {
+                Some(&Event::SpawnChild { x, .. }) => x,
+                _ => panic!("batha should spawn the bath, got {ev:?}"),
+            }
+        };
+        assert_eq!(place(false), place(true), "the bath moved with the sheep");
     }
 
     #[test]
