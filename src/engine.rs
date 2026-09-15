@@ -981,7 +981,10 @@ impl Sheep {
         }
 
         let mut face_stop = None;
-        let mut face_next = None;
+        // A transition settled outside the border table below, either because
+        // the roll has already been made or because the table's answer is for
+        // a border this is not.
+        let mut forced_next = None;
         if let Some((id, edge)) = self.window_side(world, tile, x2).filter(|_| !anim.border.is_empty())
         {
             let stood_at = self.x;
@@ -990,7 +993,7 @@ impl Sheep {
             let pick = pet.choose(&anim.border, self.situation).map(|n| (n.target, n.only));
             if matches!(pick, Some((_, Only::Vertical))) || fastrand::f64() < TURN_AT_FACE {
                 face_stop = Some(edge);
-                face_next = pick.map(|(target, _)| target);
+                forced_next = pick.map(|(target, _)| target);
             } else {
                 self.x = stood_at;
                 self.passing = Some(id);
@@ -1069,15 +1072,19 @@ impl Sheep {
             self.x = if hugging_right { s.right() - tile - 1.0 } else { s.x + 1.0 };
             self.resting_on = None;
             hit_border = true;
+            // Not the climb's own border transition: that one is the top of
+            // the screen, and would flip the sheep onto a ceiling that is not
+            // there. This is ground.
+            forced_next = pet.landing_animation();
         } else if let Some(r) = self.window_crest(world, tile, y2) {
-            // Over the top of the window it was climbing. The sideways step is
-            // a tile wide - the sheep was hugging the face, and the ledge only
-            // starts a tile in - and lands under the border transition, which
-            // for the climb is the animation for coming over an edge.
+            // Over the top of the window it was climbing. The sideways step
+            // is a tile wide - the sheep was hugging the face, and the ledge
+            // only starts a tile in.
             self.y = r.top().ceil() - tile;
             self.x = if self.x < r.left() + tile { r.left() + 1.0 } else { r.right() - tile - 1.0 };
             self.resting_on = Some(r.id);
             hit_border = true;
+            forced_next = pet.landing_animation();
         } else if y2 > 0.0 && self.y > floor && !continues(mid_x, self.y + tile + 1.0) {
             self.y = floor;
             self.resting_on = None;
@@ -1140,7 +1147,7 @@ impl Sheep {
             // A face has already drawn from the same table; rolling again here
             // could contradict the choice that held the sheep in the first
             // place.
-            if let Some(target) = face_next.or(met_next) {
+            if let Some(target) = forced_next.or(met_next) {
                 return Some(target);
             }
             if let Some(n) = pet.choose(&anim.border, self.situation) {
@@ -2445,15 +2452,38 @@ mod tests {
         s.y = 1600.0 - TILE;
         s.begin(&p, &w, TILE, 37, &mut ev);
 
+        let mut arrived = false;
         for _ in 0..40 {
             s.step(&p, &w, TILE, &mut ev);
             if s.screen(&w, TILE).id == 0 {
                 assert_eq!(s.y + TILE, 1580.0, "stepped across but not onto the floor");
                 assert!(s.x < 1880.0, "topped out beside the floor, at x={}", s.x);
-                return;
+                // The climb's own border transition is the top of the screen,
+                // where the sheep flips over and walks the ceiling. Arriving
+                // on ground has to end the climb the way climbing down does.
+                assert_eq!(
+                    Some(s.animation),
+                    p.landing_animation(),
+                    "came onto the floor with the animation for the top of the screen"
+                );
+                arrived = true;
+                break;
             }
         }
-        panic!("climbed past the monitor beside it (x={}, y={})", s.x, s.y);
+        assert!(arrived, "climbed past the monitor beside it (x={}, y={})", s.x, s.y);
+
+        // And it stays there: upside down on a ceiling that is not there, the
+        // sheep used to walk straight back out over the tall screen.
+        for _ in 0..60 {
+            s.step(&p, &w, TILE, &mut ev);
+            assert!(
+                s.x < 1920.0 || s.y + TILE > 1582.0,
+                "drifted out over the tall screen at ({}, {}) in anim {}",
+                s.x,
+                s.y,
+                s.animation
+            );
+        }
     }
 
     #[test]

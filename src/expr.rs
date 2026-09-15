@@ -6,7 +6,10 @@
 //! textual substitution followed by `eval()`; we parse properly instead.
 
 /// The identifier bindings an expression is evaluated against.
-#[derive(Clone, Copy, Debug)]
+///
+/// The default binds everything to zero, which is enough to read the constant
+/// velocities out of a pet file without having a sheep or a screen to hand.
+#[derive(Clone, Copy, Debug, Default)]
 pub struct Ctx {
     /// Full output size.
     pub screen_w: f64,

@@ -237,6 +237,37 @@ impl Pet {
         best.first().map(|(id, _)| *id).or_else(|| self.by_name("fall").map(|a| a.id))
     }
 
+    /// The animation to step out with when a climb tops out on something
+    /// horizontal - a window's ledge, or the floor of the monitor beside the
+    /// edge being climbed - rather than at the top of the screen.
+    ///
+    /// A climb up has nothing to say about this: its `<border>` is the top of
+    /// the screen, where the sheep flips over and walks the ceiling, which is
+    /// wrong anywhere the climb ends on ground. A climb *down* ends the right
+    /// way, so this is derived from that, like [`fall_animation`]: the slowest
+    /// steady straight-down move the pet has is the one that walks down a wall
+    /// rather than falling off it, and its `<border>` is where the pet goes
+    /// when the wall runs out and the sheep is standing on ground again.
+    ///
+    /// [`fall_animation`]: Self::fall_animation
+    pub fn landing_animation(&self) -> Option<u32> {
+        let ctx = Ctx::default();
+        let climb_speed = |a: &Animation| {
+            let v = |s: &str| eval_or(s, &ctx, 0.0);
+            let (y1, y2) = (v(&a.start.y), v(&a.end.y));
+            // Straight down, and at a speed that does not build: accelerating
+            // or already fast is a fall, and a fall lands, it does not step off.
+            let climbing = v(&a.start.x) == 0.0 && v(&a.end.x) == 0.0 && y1 > 0.0 && y1 == y2;
+            (climbing && !a.border.is_empty()).then_some(y1)
+        };
+        self.animations
+            .values()
+            .filter_map(|a| climb_speed(a).map(|y| (y, a.id, a.border[0].target)))
+            // Slowest first, then by id so the choice is stable.
+            .min_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)))
+            .map(|(_, _, target)| target)
+    }
+
     /// Weighted pick of a spawn point.
     pub fn choose_spawn(&self) -> Option<&Spawn> {
         // The reference sums `spawns[0]` in a loop, making later spawns
