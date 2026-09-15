@@ -413,12 +413,34 @@ impl Sheep {
 
     /// Enter `id`, resetting the sequence and spawning any companion it declares.
     fn enter(&mut self, pet: &Pet, world: &World, tile: f64, id: u32, events: &mut Vec<Event>) {
+        let screen = self.screen(world, tile);
+        self.enter_on(pet, tile, id, screen, events);
+    }
+
+    /// Enter `id` with the file's numbers measured against `screen`, which is
+    /// not always the screen the sheep is standing in.
+    ///
+    /// The file is written for a single screen, and most of its spawn points
+    /// are places just off the right edge of it - `screenW+10` - from which
+    /// the sheep walks or dives in. Put a second monitor there and that place
+    /// lies inside it, so a sheep launched off the edge of one monitor would
+    /// have the rest of its entrance measured against the monitor it is on
+    /// its way out of: it dives as far as that monitor is tall, and its
+    /// bathtub lands over there, a screen's width from where it comes down.
+    /// An entrance is measured against the monitor being entered.
+    fn enter_on(
+        &mut self,
+        pet: &Pet,
+        tile: f64,
+        id: u32,
+        screen: Screen,
+        events: &mut Vec<Event>,
+    ) {
         self.animation = id;
         self.step = 0;
-        let ctx = self.ctx(world, pet, tile);
+        let ctx = self.ctx_on(&screen, tile);
         self.steps = pet.get(id).map(|a| a.steps(&self.in_strides(&ctx))).unwrap_or(1);
 
-        let screen = self.screen(world, tile);
         for c in pet.children.iter().filter(|c| c.animation_id == id) {
             // Child coordinates are evaluated against the *parent's* state,
             // in the parent's screen-local space.
@@ -552,7 +574,9 @@ impl Sheep {
         if self.workspaces {
             self.workspace = Some(arrived.workspace);
         }
-        self.enter(pet, world, tile, next, events);
+        // Measured against the monitor it is arriving on, not whichever one
+        // the launch point off its edge happens to fall in.
+        self.enter_on(pet, tile, next, screen, events);
         self.settle();
     }
 
@@ -3081,6 +3105,42 @@ mod tests {
             }
         };
         assert_eq!(place(false), place(true), "the bath moved with the sheep");
+    }
+
+    /// The bathtub belongs where the dive comes down, whatever else is on
+    /// the desk.
+    ///
+    /// The sheep enters this one from `screenW+10`, off the right edge of the
+    /// monitor it is arriving on, and dives at 45 degrees. Where a monitor
+    /// sits immediately right of that one - as the rotated screen does on the
+    /// author's desk - the launch point falls inside it, and measuring the
+    /// entrance there put the tub a screen's width from the splash.
+    #[test]
+    fn the_bathtub_lands_where_the_dive_does() {
+        let p = pet();
+        let w = two_screens();
+        let bath = p.by_name("bathw").expect("the pet has a bathtub").id;
+        let mut baths = 0;
+        for _ in 0..3000 {
+            let mut s = Sheep::new(false);
+            let mut ev = Vec::new();
+            s.spawn(&p, &w, TILE, &mut ev);
+            let Some(&Event::SpawnChild { animation, x, y, .. }) = ev.first() else { continue };
+            if animation != bath {
+                continue;
+            }
+            baths += 1;
+            // The dive travels a pixel left for every pixel down, so where it
+            // comes down follows from where it started and how far it falls.
+            let lands = s.x - (y - s.y);
+            assert!(
+                (x - lands).abs() < 1.0,
+                "dived from ({}, {}) to the floor at {lands} and left the tub at {x}",
+                s.x,
+                s.y
+            );
+        }
+        assert!(baths > 0, "no sheep took a bath in 3000 arrivals");
     }
 
     #[test]
